@@ -5,17 +5,20 @@ import 'package:flutter/material.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
-  final backCamera = cameras.firstWhere(
-    (c) => c.lensDirection == CameraLensDirection.back,
-    orElse: () => cameras.first,
-  );
+  CameraDescription? backCamera;
+  if (cameras.isNotEmpty) {
+    backCamera = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
+  }
   runApp(CameraStreamApp(camera: backCamera));
 }
 
 class CameraStreamApp extends StatelessWidget {
-  final CameraDescription camera;
+  final CameraDescription? camera;
 
-  const CameraStreamApp({super.key, required this.camera});
+  const CameraStreamApp({super.key, this.camera});
 
   @override
   Widget build(BuildContext context) {
