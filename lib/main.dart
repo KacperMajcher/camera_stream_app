@@ -1,4 +1,3 @@
-import 'package:camera/camera.dart';
 import 'package:camera_stream_app/src/screens/camera_stream_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,27 +5,17 @@ import 'package:flutter/services.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-  final cameras = await availableCameras();
-  CameraDescription? backCamera;
-  if (cameras.isNotEmpty) {
-    backCamera = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => cameras.first,
-    );
-  }
-  runApp(CameraStreamApp(camera: backCamera));
+  runApp(const CameraStreamApp());
 }
 
 class CameraStreamApp extends StatelessWidget {
-  final CameraDescription? camera;
-
-  const CameraStreamApp({super.key, this.camera});
+  const CameraStreamApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return const MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: CameraStreamView(camera: camera),
+      home: CameraStreamView(),
     );
   }
 }
