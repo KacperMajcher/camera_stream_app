@@ -157,6 +157,11 @@ class JewelryArView: UIView {
 
     loadRingModel()
     setupFingerOccluder()
+
+    // Debug overlay on top of everything
+    debugOverlay.frame = bounds
+    debugOverlay.layer.zPosition = 200
+    addSubview(debugOverlay)
   }
 
   private func setupFingerOccluder() {
