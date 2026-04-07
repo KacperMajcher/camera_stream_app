@@ -323,116 +323,205 @@ class JewelryArView: UIView {
     }
   }
 
-  // MARK: - Ring positioning from 3D landmarks
-  
+  // MARK: - Ring positioning (world-screen hybrid approach)
+  //
+  // Position from SCREEN landmarks (with resizeAspectFill crop correction).
+  // Scale from WORLD finger width × screen-space pixels-per-meter ratio
+  //   → rotation-invariant: world gives true finger width, screen gives perspective.
+  // Orientation from WORLD landmarks (3D finger tilt).
+  //
+  // The ring lives at a fixed Z plane in SceneKit; apparent size changes
+  // come from the screen-space reference scaling with distance.
+
   private var frameCounter = 0
+
+  // Fixed depth plane – ring always sits here; perspective from screen coords.
+  private let fixedZ: Float = -0.5
 
   private func updateRingPosition(
     landmarks: [NormalizedLandmark],
-    worldLandmarks: [Landmark]
+    worldLandmarks: [Landmark],
+    isLeftHand: Bool
   ) {
-    guard let ring = ringNode, let occluder = fingerOccluderNode else {
-      return
+    guard let ring = ringNode, let occluder = fingerOccluderNode else { return }
+    guard landmarks.count > 17, worldLandmarks.count > 17 else { return }
+    guard bounds.width > 0, bounds.height > 0 else { return }
+
+    framesWithoutDetection = 0
+    frameCounter += 1
+
+    let now = CACurrentMediaTime()
+
+    // ── Visible area at the fixed Z plane ──
+    let aspect = Float(bounds.width / bounds.height)
+    let halfTan = tanf(Float.pi / 6.0) // tan(30°) for 60° FOV SceneKit camera
+    let visH = 2.0 * abs(fixedZ) * halfTan  // ≈ 0.577 scene units
+    let visW = visH * aspect
+
+    // ── Crop correction for resizeAspectFill ──
+    // Camera preset 1280×720 → portrait 720×1280. The preview may crop width.
+    let imageAspect: Float = 720.0 / 1280.0
+    let viewAspect = Float(bounds.width / bounds.height)
+    let cropX: Float = imageAspect > viewAspect ? imageAspect / viewAspect : 1.0
+    let cropY: Float = viewAspect > imageAspect ? viewAspect / imageAspect : 1.0
+
+    // ── 1. POSITION from screen landmarks (crop-corrected) ──
+    let t: Float = 0.58
+    let nx = landmarks[13].x + (landmarks[14].x - landmarks[13].x) * t
+    let ny = landmarks[13].y + (landmarks[14].y - landmarks[13].y) * t
+    let rawX = (nx - 0.5) * visW * cropX
+    let rawY = (0.5 - ny) * visH * cropY
+
+    // ── 2. SCALE: World-screen hybrid (rotation-invariant finger width) ──
+    // World landmarks give true 3D distances in metres, unaffected by viewing angle.
+    // Screen landmarks provide correct perspective scaling for the current distance.
+    // Combined: worldFingerWidth × (screenRef / worldRef) = finger width in scene units.
+    func w3(_ i: Int) -> simd_float3 {
+      simd_float3(worldLandmarks[i].x, worldLandmarks[i].y, worldLandmarks[i].z)
+    }
+    func s2(_ i: Int) -> simd_float2 {
+      let sx = (landmarks[i].x - 0.5) * visW * cropX
+      let sy = (0.5 - landmarks[i].y) * visH * cropY
+      return simd_float2(sx, sy)
     }
 
-    // Landmark indices: 0 = wrist, 5 = index MCP, 17 = pinky MCP, 13 = ring MCP, 14 = ring PIP
-    guard landmarks.count > 17, worldLandmarks.count > 17 else { return }
+    // ── Finger width from inter-MCP gap ──
+    let worldMCPGap = distance(w3(9), w3(13))
+    guard worldMCPGap > 0.001 else { return }
+    let worldFingerWidth = worldMCPGap * 0.85
 
-    // 1. Estimate distance (Z) from camera.
-    let w5 = worldLandmarks[5]
-    let w17 = worldLandmarks[17]
-    let realDist = sqrt(pow(w5.x - w17.x, 2) + pow(w5.y - w17.y, 2) + pow(w5.z - w17.z, 2))
+    // Scene-units-per-metre from multiple reference pairs, weighted by screen visibility
+    let refs: [(w: Float, s: Float)] = [
+      (distance(w3(0), w3(9)),  distance(s2(0), s2(9))),   // wrist → middle MCP
+      (distance(w3(5), w3(17)), distance(s2(5), s2(17))),  // index MCP → pinky MCP
+      (distance(w3(0), w3(5)),  distance(s2(0), s2(5))),   // wrist → index MCP
+      (distance(w3(0), w3(17)), distance(s2(0), s2(17))),  // wrist → pinky MCP
+    ]
+    var wSum: Float = 0, wTot: Float = 0
+    for r in refs where r.w > 0.005 {
+      let weight = r.s * r.s  // heavier weight for more visible (less foreshortened) pairs
+      wSum += weight * (r.s / r.w)
+      wTot += weight
+    }
+    guard wTot > 0 else { return }
+    let scenePerMetre = wSum / wTot
 
-    let n5 = landmarks[5]
-    let n17 = landmarks[17]
-    let screenDist = sqrt(pow(n5.x - n17.x, 2) + pow(n5.y - n17.y, 2))
+    // World-screen hybrid (rotation-invariant but may undersize on face-on views)
+    let hybridFingerWidth = worldFingerWidth * scenePerMetre
+    // Direct screen-space MCP gap (accurate when hand is flat to camera)
+    let screenMCPGap = distance(s2(9), s2(13))
+    let screenFingerWidth = screenMCPGap * 0.85
+    // Use the larger: screen is accurate face-on, hybrid is better when rotated
+    let fingerWidthScene = max(hybridFingerWidth, screenFingerWidth)
+    let rawScale = max(fingerWidthScene / 0.68, 0.003)  // 0.68 = torus inner diameter
 
-    let fov: Float = 60.0
-    let focalLen = 0.5 / tan(fov * .pi / 360.0)
-    // Clamp estimatedZ between 10cm and 1.5m to avoid jumps
-    let estimatedZ = max(0.1, min(1.5, (realDist * focalLen) / max(screenDist, 1e-4)))
+    // ── 3. ORIENTATION: screen-space finger direction + world palm normal ──
+    // Finger direction from SCREEN landmarks (always matches visible finger on camera)
+    let screenFinger = s2(14) - s2(13)
+    let screenFingerLen = simd_length(screenFinger)
+    guard screenFingerLen > 1e-6 else { return }
+    // Direction in SceneKit XY plane (Z=0 since ring lives on fixed Z-plane)
+    let direction = normalize(simd_float3(screenFinger.x, screenFinger.y, 0))
 
-    // 2. Calculate target position
-    let n13 = landmarks[13]
-    let n14 = landmarks[14]
-    // Increased t from 0.30 to 0.45 to move the ring further away from the hand
-    let t: Float = 0.3
-    let nx = n13.x + (n14.x - n13.x) * t
-    let ny = n13.y + (n14.y - n13.y) * t
+    // Palm normal from WORLD landmarks (only source of depth/facing info)
+    func toSK(_ l: Landmark) -> simd_float3 {
+      simd_float3(l.x, -l.y, l.z)
+    }
+    let sk0 = toSK(worldLandmarks[0])
+    let sk5 = toSK(worldLandmarks[5])
+    let sk9 = toSK(worldLandmarks[9])
+    let sk13 = toSK(worldLandmarks[13])
+    let sk17 = toSK(worldLandmarks[17])
 
-    let aspect = Float(bounds.width / bounds.height)
-    let px = (nx - 0.5) * estimatedZ / focalLen * aspect
-    let py = (0.5 - ny) * estimatedZ / focalLen
+    let crosses = [
+      cross(sk5 - sk0, sk17 - sk0),
+      cross(sk5 - sk0, sk13 - sk0),
+      cross(sk9 - sk0, sk17 - sk0),
+    ]
+    var avgPalmCross = simd_float3.zero
+    for c in crosses {
+      let len = simd_length(c)
+      if len > 1e-6 { avgPalmCross += c / len }
+    }
+    guard simd_length(avgPalmCross) > 1e-6 else { return }
 
-    let w13 = worldLandmarks[13]
-    let w14 = worldLandmarks[14]
-    let relativeZ = w13.z + (w14.z - w13.z) * t
-    let pz = -estimatedZ + Float(relativeZ)
+    var palmNormal = normalize(avgPalmCross)
+    if isLeftHand { palmNormal = -palmNormal }
 
-    // 3. Orientation & Matrix construction
-    let dx = w14.x - w13.x
-    let dy = -(w14.y - w13.y) // Flip for SceneKit
-    let dz = -(w14.z - w13.z) // Flip for SceneKit
-    let worldBoneLen = sqrt(dx * dx + dy * dy + dz * dz)
+    // Diamond locked to screen-space perpendicular of finger direction.
+    // Palm normal only determines which side is dorsal (binary sign, immune to noise).
+    let screenPerp = simd_float3(-direction.y, direction.x, 0)  // 90° CCW in XY plane
+    // Project palm normal perpendicular to finger direction and pick the correct side
+    let projNormal = palmNormal - dot(palmNormal, direction) * direction
+    let upVec = dot(projNormal, screenPerp) >= 0 ? screenPerp : -screenPerp
+    let rightVec = normalize(cross(direction, upVec))
+    let targetRotation = simd_quaternion(simd_float3x3(rightVec, direction, upVec))
 
-    // We want the ring's "hole" (Y-axis in many models) to align with the finger bone.
-    let boneVec = simd_float3(dx, dy, dz)
-    let direction = normalize(boneVec)
-    
-    // Use Middle finger (9) and Ring finger (13) to find the "side" vector of the hand
-    let w9 = worldLandmarks[9]
-    let sideVec = normalize(simd_float3(w9.x - w13.x, -(w9.y - w13.y), -(w9.z - w13.z)))
-    
-    // Normal to the finger surface - flipped cross product to point "up" from the back of the hand
-    let upVec = normalize(cross(direction, sideVec))
-    let rightVec = cross(direction, upVec)
-    
-    // Construct rotation matrix (Column-major)
-    // We assume the ring model's "hole axis" is Y.
-    let transform = simd_float4x4(
-      simd_float4(rightVec.x, rightVec.y, rightVec.z, 0),
-      simd_float4(direction.x, direction.y, direction.z, 0),
-      simd_float4(upVec.x, upVec.y, upVec.z, 0),
-      simd_float4(px, py, pz, 1)
-    )
+    if frameCounter % 60 == 0 {
+      let dotCam = dot(palmNormal, simd_float3(0, 0, 1))
+      print("[JewelryAR] 🔍 palmNormal·cam = \(String(format: "%.2f", dotCam)) (>0=toward cam, <0=away)")
+    }
 
-    // 4. Scale
-    // Reducing from 0.60 to 0.53 for a tighter fit.
-    let rawScale = worldBoneLen * 0.53
-    
-    frameCounter += 1
-    
-    // Apply smoothing to the whole matrix or components
-    let targetPos = SCNVector3(px, py, pz)
-    
+    // Bail if quaternion is invalid (NaN)
+    guard targetRotation.real.isFinite else { return }
+
+    // ── 4. SMOOTHING (One-Euro for pos/scale, slerp for rotation) ──
+    let smoothX = filterPosX.filter(rawX, at: now)
+    let smoothY = filterPosY.filter(rawY, at: now)
+    let smoothScale = filterScale.filter(rawScale, at: now)
+
     if hasSmoothedValues {
-      smoothedPosition = lerpVec3(smoothedPosition, targetPos, t: smoothingFactor)
-      // High-inertia smoothing for scale to prevent "blinking"
-      smoothedScale = smoothedScale + (rawScale - smoothedScale) * scaleSmoothingFactor
+      // Ensure shortest-path slerp: negate target if it's in the opposite hemisphere.
+      // This prevents the ring from taking the "long way around" (180° flip).
+      var target = targetRotation
+      if simd_dot(smoothedRotation, target) < 0 {
+        target = simd_quatf(ix: -target.imag.x, iy: -target.imag.y,
+                            iz: -target.imag.z, r: -target.real)
+      }
+      smoothedRotation = simd_slerp(smoothedRotation, target, rotationAlpha)
     } else {
-      smoothedPosition = targetPos
-      smoothedScale = rawScale
+      smoothedRotation = targetRotation
       hasSmoothedValues = true
     }
-    
-    if frameCounter % 60 == 0 {
-       print("[JewelryAR] ✅ Positioning ring. Scaled width: \(smoothedScale * 100)cm")
+
+    if frameCounter % 30 == 0 {
+      print("[JewelryAR] 📍 pos=(\(String(format: "%.4f", smoothX)), \(String(format: "%.4f", smoothY))) scale=\(String(format: "%.4f", smoothScale)) bounds=\(bounds.width)x\(bounds.height)")
     }
 
-    ring.simdTransform = transform
-    ring.simdScale = simd_float3(smoothedScale, smoothedScale, smoothedScale)
+    // ── 5. APPLY ──
+    ring.position = SCNVector3(smoothX, smoothY, fixedZ)
+    ring.simdOrientation = smoothedRotation
+    ring.simdScale = simd_float3(repeating: smoothScale)
     ring.isHidden = false
 
-    // Occluder: must be slightly smaller than the ring inner radius (which is scale * 0.45)
-    occluder.simdTransform = transform
-    if let cylinder = occluder.geometry as? SCNCylinder {
-      cylinder.radius = CGFloat(smoothedScale * 0.45) 
-      cylinder.height = CGFloat(worldBoneLen * 1.8)
+    occluder.position = ring.position
+    occluder.simdOrientation = smoothedRotation
+    if let cyl = occluder.geometry as? SCNCylinder {
+      // Radius must nearly fill the torus interior (ringRadius=0.40) so the
+      // back half of the ring is hidden behind the "finger" depth mask.
+      cyl.radius = CGFloat(smoothScale * 0.38)
+      cyl.height = CGFloat(smoothScale * 2.0)
     }
     occluder.isHidden = false
 
-    // Optional debug log
-    // print("[JewelryAR] Z: \(estimatedZ), Pos: \(px), \(py), \(pz)")
+    // ── 6. DEBUG OVERLAY ──
+    var debugData = DebugOverlayData()
+    debugData.landmarks = landmarks.map { (CGFloat($0.x), CGFloat($0.y)) }
+    debugData.ringNorm = CGPoint(x: CGFloat(nx), y: CGFloat(ny))
+    debugData.palmNormal3D = palmNormal
+    debugData.ringQuaternion = smoothedRotation
+    debugData.palmCenter = CGPoint(
+      x: CGFloat((landmarks[0].x + landmarks[5].x + landmarks[9].x + landmarks[13].x + landmarks[17].x) / 5.0),
+      y: CGFloat((landmarks[0].y + landmarks[5].y + landmarks[9].y + landmarks[13].y + landmarks[17].y) / 5.0)
+    )
+    debugData.mcpWidth = worldFingerWidth
+    debugData.boneMaxWidth = 0  // no cap
+    debugData.hybridFW = hybridFingerWidth
+    debugData.screenFW = screenFingerWidth
+    debugData.finalScale = smoothScale
+    debugData.isCapped = false
+    debugOverlay.data = debugData
+    debugOverlay.setNeedsDisplay()
   }
 
   private func lerpVec3(_ a: SCNVector3, _ b: SCNVector3, t: Float) -> SCNVector3 {
