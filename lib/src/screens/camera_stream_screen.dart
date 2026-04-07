@@ -1,219 +1,161 @@
 import 'dart:math';
-import 'package:camera/camera.dart';
 import 'package:camera_stream_app/src/services/hand_tracking_service.dart';
+import 'package:camera_stream_app/src/widgets/jewelry_ar_view.dart';
 import 'package:flutter/material.dart';
 
 enum RingSize {
-  ct0_5('0.5 ct', 5.0),
-  ct1_0('1.0 ct', 6.5),
-  ct2_0('2.0 ct', 8.0);
+  r1('1', 1),
+  r2('2', 2),
+  r3('3', 3),
+  r4('4', 4),
+  r5('5', 5);
 
-  const RingSize(this.label, this.mm);
+  const RingSize(this.label, this.assetIndex);
   final String label;
-  final double mm;
+  final int assetIndex;
 }
 
 class CameraStreamView extends StatefulWidget {
-  final CameraDescription? camera;
-
-  const CameraStreamView({super.key, required this.camera});
+  const CameraStreamView({super.key});
 
   @override
   State<CameraStreamView> createState() => _CameraStreamViewState();
 }
 
 class _CameraStreamViewState extends State<CameraStreamView> {
-  CameraController? _controller;
-  late Future<void> _initFuture;
   final _handTracking = HandTrackingService();
-  HandLandmarks? _landmarks;
-  RingSize _selectedSize = RingSize.ct1_0;
+  HandLandmarks3D? _landmarks;
+  RingSize _selectedSize = RingSize.r3;
+  bool _isTrackingStarted = false;
 
   @override
   void initState() {
     super.initState();
-    _handTracking.startListening();
-    _handTracking.landmarksStream.listen((lm) {
-      if (mounted) setState(() => _landmarks = lm);
-    });
-
-    if (widget.camera != null) {
-      _controller = CameraController(
-        widget.camera!,
-        ResolutionPreset.high,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.bgra8888,
-      );
-      _initFuture = _controller!.initialize().then((_) {
-        if (!mounted) return;
-        _controller!.startImageStream((CameraImage image) {
-          _handTracking.sendFrame(image);
-        });
-        setState(() {});
-      });
-    } else {
-      _initFuture = Future.error('No available cameras found.');
-    }
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
     _handTracking.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: FutureBuilder<void>(
-        future: _initFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.done &&
-              snapshot.error == null &&
-              _controller != null) {
-            return Column(
-              children: [
-                Expanded(
-                  child: Center(
-                    child: AspectRatio(
-                      aspectRatio: 1.0 / _controller!.value.aspectRatio,
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          final w = constraints.maxWidth;
-                          final h = constraints.maxHeight;
-                          return Stack(
-                            children: [
-                              Positioned.fill(
-                                child: CameraPreview(_controller!),
-                              ),
-                              if (_landmarks != null)
-                                Positioned.fill(
-                                  child: CustomPaint(
-                                    painter: _HandSkeletonPainter(
-                                      landmarks: _landmarks!,
-                                      selectedSize: _selectedSize,
-                                      width: w,
-                                      height: h,
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                ),
-                _SizeSelector(
-                  selected: _selectedSize,
-                  onChanged: (s) => setState(() => _selectedSize = s),
-                ),
-              ],
-            );
-          } else if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  snapshot.error.toString(),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white, fontSize: 18),
-                ),
-              ),
-            );
-          } else {
-            return const Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            );
-          }
-        },
-      ),
-    );
-  }
-}
+    final lm = _landmarks;
 
-class _HandSkeletonPainter extends CustomPainter {
-  final HandLandmarks landmarks;
-  final RingSize selectedSize;
-  final double width;
-  final double height;
-
-  _HandSkeletonPainter({
-    required this.landmarks,
-    required this.selectedSize,
-    required this.width,
-    required this.height,
-  });
-
-  Offset _s(Offset n) => Offset(n.dx * width, n.dy * height);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final bonePaint = Paint()
-      ..color = Colors.greenAccent
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
-
-    final dotPaint = Paint()
-      ..color = Colors.white
-      ..style = PaintingStyle.fill;
-
-    for (final (a, b) in handBones) {
-      final ptA = landmarks.get(a);
-      final ptB = landmarks.get(b);
-      if (ptA != null && ptB != null) {
-        canvas.drawLine(_s(ptA), _s(ptB), bonePaint);
+    // Compute debug values from landmarks 0 (wrist), 13 (ring MCP), 14 (ring PIP).
+    double? fingerScale;
+    double? fingerAngleDeg;
+    double? depthDelta;
+    if (lm != null) {
+      final wrist = lm.wrist;
+      final l13 = lm.ringMCP;
+      final l14 = lm.ringPIP;
+      if (l13 != null && l14 != null) {
+        final dx = l14.x - l13.x;
+        final dy = l14.y - l13.y;
+        fingerScale = sqrt(dx * dx + dy * dy);
+        fingerAngleDeg = atan2(dy, dx) * 180 / pi;
+      }
+      if (wrist != null && l13 != null) {
+        depthDelta = l13.z - wrist.z;
       }
     }
 
-    for (final pt in landmarks.joints.values) {
-      canvas.drawCircle(_s(pt), 4, dotPaint);
-    }
-
-    final ringMCP = landmarks.get('VNHLKRMCP');
-    final ringPIP = landmarks.get('VNHLKRPIP');
-    final indexMCP = landmarks.get('VNHLKIMCP');
-    final middleMCP = landmarks.get('VNHLKMMCP');
-
-    if (ringMCP == null || ringPIP == null) return;
-
-    final mcpPx = _s(ringMCP);
-    final pipPx = _s(ringPIP);
-    final vec = pipPx - mcpPx;
-    final anchor = mcpPx + Offset(vec.dx * 0.7, vec.dy * 0.7);
-
-    double mmToPx = 8.0;
-    if (indexMCP != null && middleMCP != null) {
-      final d = (_s(indexMCP) - _s(middleMCP)).distance;
-      mmToPx = d / 20.0;
-    }
-
-    final diameter = selectedSize.mm * mmToPx;
-
-    final angle = atan2(vec.dy, vec.dx);
-
-    canvas.save();
-    canvas.translate(anchor.dx, anchor.dy);
-    canvas.rotate(angle);
-
-    final ringFill = Paint()
-      ..color = Colors.amber.withValues(alpha: 0.45)
-      ..style = PaintingStyle.fill;
-    final ringBorder = Paint()
-      ..color = Colors.amber
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
-
-    canvas.drawCircle(Offset.zero, diameter / 2, ringFill);
-    canvas.drawCircle(Offset.zero, diameter / 2, ringBorder);
-    canvas.restore();
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Column(
+        children: [
+          Expanded(
+            child: Stack(
+              children: [
+                // Native platform view: camera + SceneKit/Filament + MediaPipe
+                Positioned.fill(
+                  child: JewelryArView(
+                    ringSize: _selectedSize.assetIndex,
+                    onPlatformViewCreated: (_) {
+                      if (_isTrackingStarted) return;
+                      _isTrackingStarted = true;
+                      _handTracking.startListening();
+                      _handTracking.landmarksStream.listen((lm) {
+                        if (mounted) setState(() => _landmarks = lm);
+                      });
+                    },
+                  ),
+                ),
+                // Debug overlay
+                Positioned(
+                  top: MediaQuery.of(context).padding.top + 12,
+                  left: 16,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (fingerScale != null)
+                          Text(
+                            'fingerScale: ${fingerScale.toStringAsFixed(4)}\n'
+                            'fingerAngle: ${fingerAngleDeg?.toStringAsFixed(1)}°\n'
+                            'depthΔ (L13-wrist): ${depthDelta?.toStringAsFixed(4) ?? '—'}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontFamily: 'monospace',
+                              fontWeight: FontWeight.w500,
+                              height: 1.5,
+                            ),
+                          ),
+                        if (lm?.ringPosition != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'RING POSITION:\n'
+                            '  X: ${lm!.ringPosition!.x.toStringAsFixed(4)}\n'
+                            '  Y: ${lm.ringPosition!.y.toStringAsFixed(4)}\n'
+                            '  Z: ${lm.ringPosition!.z.toStringAsFixed(4)}',
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                              fontWeight: FontWeight.bold,
+                              height: 1.3,
+                            ),
+                          ),
+                        ],
+                        if (lm?.ringScale != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'RING SCALE: ${lm!.ringScale!.toStringAsFixed(4)}',
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          _SizeSelector(
+            selected: _selectedSize,
+            onChanged: (s) => setState(() => _selectedSize = s),
+          ),
+        ],
+      ),
+    );
   }
-
-  @override
-  bool shouldRepaint(_HandSkeletonPainter old) =>
-      old.landmarks != landmarks || old.selectedSize != selectedSize;
 }
 
 class _SizeSelector extends StatelessWidget {
