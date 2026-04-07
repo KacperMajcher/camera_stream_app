@@ -667,3 +667,220 @@ extension JewelryArView: FlutterStreamHandler {
     return nil
   }
 }
+
+// MARK: - One-Euro Filter
+// Adaptive low-pass filter: heavy smoothing when signal is stable,
+// fast response when signal changes rapidly. Ideal for hand tracking.
+// Reference: Casiez et al. "1€ Filter" (CHI 2012)
+
+struct OneEuroFilter {
+  var minCutoff: Float  // Minimum smoothing cutoff frequency (Hz). Lower = smoother when still.
+  var beta: Float       // Speed coefficient. Higher = more responsive to fast movements.
+  private let dCutoff: Float = 1.0
+
+  private var xPrev: Float?
+  private var dxPrev: Float = 0
+  private var lastTime: Double = 0
+
+  init(minCutoff: Float, beta: Float) {
+    self.minCutoff = minCutoff
+    self.beta = beta
+  }
+
+  mutating func filter(_ x: Float, at time: Double) -> Float {
+    guard let prev = xPrev else {
+      xPrev = x
+      lastTime = time
+      return x
+    }
+
+    let dt = max(Float(time - lastTime), 1.0 / 120.0) // floor at 120 fps
+    lastTime = time
+
+    // Smoothed derivative
+    let dx = (x - prev) / dt
+    let aDx = alpha(dt: dt, cutoff: dCutoff)
+    dxPrev = aDx * dx + (1 - aDx) * dxPrev
+
+    // Adaptive cutoff: rises with speed
+    let cutoff = minCutoff + beta * abs(dxPrev)
+    let a = alpha(dt: dt, cutoff: cutoff)
+
+    let result = a * x + (1 - a) * prev
+    xPrev = result
+    return result
+  }
+
+  mutating func reset() {
+    xPrev = nil
+    dxPrev = 0
+  }
+
+  private func alpha(dt: Float, cutoff: Float) -> Float {
+    let tau = 1.0 / (2.0 * Float.pi * cutoff)
+    return 1.0 / (1.0 + tau / dt)
+  }
+}
+
+// MARK: - Debug Overlay Data & View
+
+struct DebugOverlayData {
+  var landmarks: [(x: CGFloat, y: CGFloat)] = []  // normalized 0-1
+  var ringNorm: CGPoint = .zero                     // ring position normalized
+  var palmCenter: CGPoint = .zero                   // palm center normalized
+  var palmNormal3D: simd_float3 = .zero             // palm normal in SceneKit space
+  var ringQuaternion: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+  var mcpWidth: Float = 0
+  var boneMaxWidth: Float = 0
+  var hybridFW: Float = 0
+  var screenFW: Float = 0
+  var finalScale: Float = 0
+  var isCapped: Bool = false
+}
+
+class DebugOverlayView: UIView {
+  var data = DebugOverlayData()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isOpaque = false
+    backgroundColor = .clear
+    isUserInteractionEnabled = false
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  // Convert normalized MediaPipe coords → UIView points (resizeAspectFill)
+  private func toView(_ nx: CGFloat, _ ny: CGFloat) -> CGPoint {
+    let imgW: CGFloat = 720, imgH: CGFloat = 1280  // portrait after rotation
+    let scale = max(bounds.width / imgW, bounds.height / imgH)
+    let projW = imgW * scale, projH = imgH * scale
+    let offX = (projW - bounds.width) / 2
+    let offY = (projH - bounds.height) / 2
+    return CGPoint(x: nx * projW - offX, y: ny * projH - offY)
+  }
+
+  // Finger color coding
+  private func colorForLandmark(_ i: Int) -> UIColor {
+    switch i {
+    case 0:      return .white          // wrist
+    case 1...4:  return .systemRed      // thumb
+    case 5...8:  return .systemOrange   // index
+    case 9...12: return .systemYellow   // middle
+    case 13...16: return .systemGreen   // ring
+    case 17...20: return .systemBlue    // pinky
+    default:     return .white
+    }
+  }
+
+  // Hand bone connections (same as MediaPipe skeleton)
+  private let bones: [(Int, Int)] = [
+    (0,1),(0,5),(0,9),(0,13),(0,17),     // wrist → finger bases
+    (5,9),(9,13),(13,17),                 // transverse metacarpal
+    (1,2),(2,3),(3,4),                    // thumb
+    (5,6),(6,7),(7,8),                    // index
+    (9,10),(10,11),(11,12),               // middle
+    (13,14),(14,15),(15,16),              // ring
+    (17,18),(18,19),(19,20),              // pinky
+  ]
+
+  override func draw(_ rect: CGRect) {
+    guard let ctx = UIGraphicsGetCurrentContext() else { return }
+    let lm = data.landmarks
+    guard lm.count >= 21 else { return }
+
+    let pts = lm.enumerated().map { (i, l) in toView(l.x, l.y) }
+
+    // ── 1. Skeleton lines ──
+    ctx.setLineWidth(1.5)
+    ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.4).cgColor)
+    for (a, b) in bones where a < pts.count && b < pts.count {
+      ctx.move(to: pts[a])
+      ctx.addLine(to: pts[b])
+    }
+    ctx.strokePath()
+
+    // ── 2. Landmark dots ──
+    for (i, pt) in pts.enumerated() {
+      let r: CGFloat = i == 13 || i == 14 ? 6 : 4  // ring finger joints bigger
+      let color = colorForLandmark(i)
+      ctx.setFillColor(color.cgColor)
+      ctx.fillEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
+      // Dot border
+      ctx.setStrokeColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+      ctx.setLineWidth(1.0)
+      ctx.strokeEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
+    }
+
+    // ── 3. Palm normal arrow (cyan) ──
+    let palmPt = toView(data.palmCenter.x, data.palmCenter.y)
+    let nrm = data.palmNormal3D
+    let arrowLen: CGFloat = 60
+    // Project 3D normal to screen: use X directly, flip Y (screen Y is down)
+    let nLen = CGFloat(sqrtf(nrm.x * nrm.x + nrm.y * nrm.y))
+    if nLen > 0.01 {
+      let ndx = CGFloat(nrm.x) / nLen * arrowLen
+      let ndy = CGFloat(nrm.y) / nLen * arrowLen  // already in SceneKit space (Y up → negate for screen)
+      let tip = CGPoint(x: palmPt.x + ndx, y: palmPt.y - ndy)
+      ctx.setStrokeColor(UIColor.cyan.cgColor)
+      ctx.setLineWidth(3.0)
+      ctx.move(to: palmPt)
+      ctx.addLine(to: tip)
+      ctx.strokePath()
+      // Arrowhead
+      ctx.setFillColor(UIColor.cyan.cgColor)
+      ctx.fillEllipse(in: CGRect(x: tip.x - 4, y: tip.y - 4, width: 8, height: 8))
+    }
+
+    // ── 4. Ring orientation axes at ring position ──
+    let ringPt = toView(data.ringNorm.x, data.ringNorm.y)
+    let q = data.ringQuaternion
+    let axisLen: CGFloat = 40
+    let axes: [(simd_float3, UIColor)] = [
+      (simd_float3(1, 0, 0), .systemRed),    // right (X)
+      (simd_float3(0, 1, 0), .systemGreen),  // up/finger direction (Y)
+      (simd_float3(0, 0, 1), .systemBlue),   // normal (Z)
+    ]
+    for (dir, color) in axes {
+      let rotated = q.act(dir)
+      let dx = CGFloat(rotated.x) * axisLen
+      let dy = CGFloat(rotated.y) * axisLen
+      let end = CGPoint(x: ringPt.x + dx, y: ringPt.y - dy)
+      ctx.setStrokeColor(color.cgColor)
+      ctx.setLineWidth(2.5)
+      ctx.move(to: ringPt)
+      ctx.addLine(to: end)
+      ctx.strokePath()
+    }
+
+    // ── 5. Scale debug panel ──
+    let capStr = data.isCapped ? " [CAPPED]" : ""
+    let scaleText = String(format: """
+      MCP: %.4f  Bone cap: %.4f%@
+      Hybrid: %.4f  Screen: %.4f
+      Final: %.4f
+      """, data.mcpWidth, data.boneMaxWidth, capStr,
+      data.hybridFW, data.screenFW, data.finalScale)
+
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+      .foregroundColor: UIColor.white,
+    ]
+    let textSize = (scaleText as NSString).boundingRect(
+      with: CGSize(width: 300, height: 200),
+      options: .usesLineFragmentOrigin,
+      attributes: attrs, context: nil).size
+
+    let textOrigin = CGPoint(x: bounds.width - textSize.width - 16,
+                             y: bounds.height - textSize.height - 80)
+    // Background
+    let bgRect = CGRect(x: textOrigin.x - 8, y: textOrigin.y - 4,
+                        width: textSize.width + 16, height: textSize.height + 8)
+    ctx.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+    let bgPath = UIBezierPath(roundedRect: bgRect, cornerRadius: 6)
+    ctx.addPath(bgPath.cgPath)
+    ctx.fillPath()
+
+    (scaleText as NSString).draw(at: textOrigin, withAttributes: attrs)
+  }
+}
