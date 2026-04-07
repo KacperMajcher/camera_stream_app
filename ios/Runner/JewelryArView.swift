@@ -46,13 +46,18 @@ class JewelryArView: UIView {
   private let modelAsset: String
   private var ringSize: Int
 
-  // MARK: - Smoothing (one-euro style simple EMA)
+  // MARK: - One-Euro Filters (adaptive smoothing: smooth when still, responsive when fast)
 
-  private var smoothedPosition = SCNVector3Zero
-  private var smoothedScale: Float = 0.02 // Typical initial ring scale
+  private var filterPosX = OneEuroFilter(minCutoff: 1.5, beta: 0.6)
+  private var filterPosY = OneEuroFilter(minCutoff: 1.5, beta: 0.6)
+  private var filterScale = OneEuroFilter(minCutoff: 0.4, beta: 0.08)
+  private var smoothedRotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
   private var hasSmoothedValues = false
-  private let smoothingFactor: Float = 0.35
-  private let scaleSmoothingFactor: Float = 0.05 // Very slow smoothing for size to prevent flickering
+  private let rotationAlpha: Float = 0.35
+
+  // Grace period: keep showing ring briefly when tracking is lost
+  private var framesWithoutDetection = 0
+  private let gracePeriodFrames = 8
 
   // MARK: - Init
 
