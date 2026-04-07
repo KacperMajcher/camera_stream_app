@@ -1,60 +1,96 @@
 import 'dart:async';
-import 'package:camera/camera.dart';
 import 'package:flutter/services.dart';
+import 'package:vector_math/vector_math_64.dart';
 
-/// Hand landmarks from VNHumanHandPoseObservation (rawValue of joint names)
-class HandLandmarks {
-  final Map<String, Offset> joints; // name → normalized (x, y)
+/// 3D hand landmark from MediaPipe Hands.
+/// x, y: normalized screen coords [0,1]. z: depth in metres (world landmark).
+class HandLandmark3D {
+  final double x;
+  final double y;
+  final double z;
 
-  const HandLandmarks(this.joints);
+  const HandLandmark3D(this.x, this.y, this.z);
 
-  Offset? get(String name) => joints[name];
+  Vector3 toVector3() => Vector3(x, y, z);
 }
 
+/// Full set of 21 MediaPipe hand landmarks with 3D coordinates.
+class HandLandmarks3D {
+  /// Indexed 0-20 matching MediaPipe joint indices.
+  final Map<int, HandLandmark3D> joints;
+  
+  /// Current calculated 3D position of the ring in camera space.
+  final Vector3? ringPosition;
+  
+  /// Current calculated scale of the ring.
+  final double? ringScale;
+
+  const HandLandmarks3D(this.joints, {this.ringPosition, this.ringScale});
+
+  HandLandmark3D? operator [](int index) => joints[index];
+
+  /// Convenience accessors for the ring-placement joints.
+  HandLandmark3D? get wrist => joints[0];
+  HandLandmark3D? get ringMCP => joints[13];
+  HandLandmark3D? get ringPIP => joints[14];
+}
+
+/// Receives 3D hand landmarks from native MediaPipe integration.
+///
+/// The native platform view owns the camera and MediaPipe session.
+/// This service only listens for landmark results via EventChannel.
 class HandTrackingService {
-  static const _method = MethodChannel('vision_hand_tracking');
-  static const _events = EventChannel('vision_hand_tracking/events');
+  static const _events = EventChannel('jewelry_ar_view_events');
 
   StreamSubscription<dynamic>? _eventSub;
-  final _controller = StreamController<HandLandmarks>.broadcast();
+  final _controller = StreamController<HandLandmarks3D>.broadcast();
 
-  Stream<HandLandmarks> get landmarksStream => _controller.stream;
+  Stream<HandLandmarks3D> get landmarksStream => _controller.stream;
 
   void startListening() {
+    if (_eventSub != null) return;
     _eventSub = _events.receiveBroadcastStream().listen((data) {
       if (data is! Map) return;
-      final jointsRaw = data['joints'];
-      if (jointsRaw is! Map) return;
+      final landmarksRaw = data['landmarks'];
+      if (landmarksRaw is! Map) return;
 
-      final joints = <String, Offset>{};
-      jointsRaw.forEach((key, value) {
+      final joints = <int, HandLandmark3D>{};
+      landmarksRaw.forEach((key, value) {
         if (value is Map) {
           final x = (value['x'] as num?)?.toDouble();
           final y = (value['y'] as num?)?.toDouble();
-          if (x != null && y != null) {
-            joints[key as String] = Offset(x, y);
+          final z = (value['z'] as num?)?.toDouble();
+          if (x != null && y != null && z != null) {
+            joints[key is int ? key : int.parse(key.toString())] =
+                HandLandmark3D(x, y, z);
           }
         }
       });
 
-      if (joints.isNotEmpty) {
-        _controller.add(HandLandmarks(joints));
+      Vector3? ringPos;
+      final ringPosRaw = data['ringPosition'];
+      if (ringPosRaw is Map) {
+        ringPos = Vector3(
+          (ringPosRaw['x'] as num).toDouble(),
+          (ringPosRaw['y'] as num).toDouble(),
+          (ringPosRaw['z'] as num).toDouble(),
+        );
       }
-    });
-  }
 
-  Future<void> sendFrame(CameraImage image) async {
-    if (image.planes.isEmpty) return;
-    try {
-      await _method.invokeMethod('processFrame', {
-        'pixels': image.planes[0].bytes,
-        'width': image.width,
-        'height': image.height,
-        'bytesPerRow': image.planes[0].bytesPerRow,
-      });
-    } on PlatformException {
-      // ignore single frame errors
-    }
+      final ringScale = (data['ringScale'] as num?)?.toDouble();
+
+      if (joints.isNotEmpty) {
+        _controller.add(HandLandmarks3D(
+          joints,
+          ringPosition: ringPos,
+          ringScale: ringScale,
+        ));
+      }
+    }, onError: (Object error, StackTrace stackTrace) {
+      // Platform view may not be ready yet; avoid crashing the UI.
+      if (error is MissingPluginException) return;
+      _controller.addError(error, stackTrace);
+    });
   }
 
   void dispose() {
@@ -63,36 +99,20 @@ class HandTrackingService {
   }
 }
 
-/// Hand bone connections – Apple Vision native keys (VNRecognizedPointKey.rawValue)
-const List<(String, String)> handBones = [
-  // Wrist → base of each finger
-  ('VNHLKWRI', 'VNHLKTCMC'),
-  ('VNHLKWRI', 'VNHLKIMCP'),
-  ('VNHLKWRI', 'VNHLKMMCP'),
-  ('VNHLKWRI', 'VNHLKRMCP'),
-  ('VNHLKWRI', 'VNHLKPMCP'),
-  // Transverse metacarpal bone
-  ('VNHLKIMCP', 'VNHLKMMCP'),
-  ('VNHLKMMCP', 'VNHLKRMCP'),
-  ('VNHLKRMCP', 'VNHLKPMCP'),
+/// MediaPipe hand bone connections (joint index pairs) for skeleton debug overlay.
+const List<(int, int)> handBones = [
+  // Wrist to finger bases
+  (0, 1), (0, 5), (0, 9), (0, 13), (0, 17),
+  // Transverse metacarpal
+  (5, 9), (9, 13), (13, 17),
   // Thumb
-  ('VNHLKTCMC', 'VNHLKTMP'),
-  ('VNHLKTMP', 'VNHLKTIP'),
-  ('VNHLKTIP', 'VNHLKTTIP'),
+  (1, 2), (2, 3), (3, 4),
   // Index
-  ('VNHLKIMCP', 'VNHLKIPIP'),
-  ('VNHLKIPIP', 'VNHLKIDIP'),
-  ('VNHLKIDIP', 'VNHLKITIP'),
+  (5, 6), (6, 7), (7, 8),
   // Middle
-  ('VNHLKMMCP', 'VNHLKMPIP'),
-  ('VNHLKMPIP', 'VNHLKMDIP'),
-  ('VNHLKMDIP', 'VNHLKMTIP'),
+  (9, 10), (10, 11), (11, 12),
   // Ring
-  ('VNHLKRMCP', 'VNHLKRPIP'),
-  ('VNHLKRPIP', 'VNHLKRDIP'),
-  ('VNHLKRDIP', 'VNHLKRTIP'),
-  // Little
-  ('VNHLKPMCP', 'VNHLKPPIP'),
-  ('VNHLKPPIP', 'VNHLKPDIP'),
-  ('VNHLKPDIP', 'VNHLKPTIP'),
+  (13, 14), (14, 15), (15, 16),
+  // Pinky
+  (17, 18), (18, 19), (19, 20),
 ];
