@@ -27,6 +27,10 @@ class JewelryArView: UIView {
   private var ringNode: SCNNode?
   private var fingerOccluderNode: SCNNode?
 
+  // MARK: - Debug overlay
+
+  private let debugOverlay = DebugOverlayView()
+
   // MARK: - MediaPipe
 
   private var handLandmarker: HandLandmarker?
