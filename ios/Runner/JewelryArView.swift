@@ -568,9 +568,20 @@ class JewelryArView: UIView {
   }
 
   private func hideRing() {
+    framesWithoutDetection += 1
+
+    // Grace period: keep ring visible for a few frames to avoid flicker on momentary loss
+    if framesWithoutDetection <= gracePeriodFrames {
+      return
+    }
+
     ringNode?.isHidden = true
     fingerOccluderNode?.isHidden = true
+    // Reset all filter state so re-acquisition starts fresh
     hasSmoothedValues = false
+    filterPosX.reset()
+    filterPosY.reset()
+    filterScale.reset()
   }
 }
 
