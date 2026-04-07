@@ -629,7 +629,8 @@ extension JewelryArView: HandLandmarkerLiveStreamDelegate {
 
     guard let result = result,
           let firstHand = result.landmarks.first,
-          let firstWorld = result.worldLandmarks.first
+          let firstWorld = result.worldLandmarks.first,
+          let handedness = result.handedness.first?.first
     else {
       DispatchQueue.main.async { [weak self] in
         self?.hideRing()
@@ -637,13 +638,15 @@ extension JewelryArView: HandLandmarkerLiveStreamDelegate {
       return
     }
 
+    let isLeftHand = handedness.categoryName == "Left"
+
     if frameCounter % 60 == 0 {
-      print("[JewelryAR] ✅ hand detected")
+      print("[JewelryAR] ✅ \(handedness.categoryName) hand detected")
     }
 
     // Update 3D ring position on main thread (SceneKit)
     DispatchQueue.main.async { [weak self] in
-      self?.updateRingPosition(landmarks: firstHand, worldLandmarks: firstWorld)
+      self?.updateRingPosition(landmarks: firstHand, worldLandmarks: firstWorld, isLeftHand: isLeftHand)
     }
 
     // Stream landmarks back to Flutter
