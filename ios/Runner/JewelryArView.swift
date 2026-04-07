@@ -226,34 +226,71 @@ class JewelryArView: UIView {
   }
 
   private func buildFallbackRing() {
-    // A torus with total diameter of 1.0 unit
-    let torus = SCNTorus(ringRadius: 0.45, pipeRadius: 0.05)
-    let material = SCNMaterial()
-    material.lightingModel = .phong
-    material.diffuse.contents = UIColor.systemYellow
-    material.specular.contents = UIColor.white
-    material.shininess = 0.9
-    torus.materials = [material]
+    // Thinner band: pipeRadius 0.06 (was 0.10)
+    let torus = SCNTorus(ringRadius: 0.40, pipeRadius: 0.06)
+    let bandMaterial = SCNMaterial()
+    bandMaterial.lightingModel = .physicallyBased
+    bandMaterial.diffuse.contents = UIColor(red: 0.85, green: 0.65, blue: 0.13, alpha: 1.0)
+    bandMaterial.metalness.contents = 0.95
+    bandMaterial.roughness.contents = 0.15
+    bandMaterial.isDoubleSided = true
+    torus.materials = [bandMaterial]
 
     let fallbackNode = SCNNode(geometry: torus)
-    
-    // Add a RED marker on "top" (Z-axis in our matrix alignment)
-    // This will help verify if the ring stays on top of the finger.
-    let markerGeo = SCNSphere(radius: 0.12)
-    let markerMat = SCNMaterial()
-    markerMat.diffuse.contents = UIColor.systemRed
-    markerMat.lightingModel = .phong
-    markerGeo.materials = [markerMat]
-    
-    let markerNode = SCNNode(geometry: markerGeo)
-    // Position it on the outer edge of the torus along the Z axis (upVec)
-    markerNode.position = SCNVector3(0, 0, 0.5) 
-    fallbackNode.addChildNode(markerNode)
+
+    // ── Diamond / gem on top (Z+ in model space = dorsal side of finger) ──
+    // Multi-faceted gem using SCNSphere with low segment count for faceted look
+    let gemRadius: CGFloat = 0.12
+    let gemGeo = SCNSphere(radius: gemRadius)
+    gemGeo.segmentCount = 8  // Low segment count = faceted diamond look
+
+    let gemMat = SCNMaterial()
+    gemMat.lightingModel = .physicallyBased
+    // Slightly blue-white diamond color with high transparency/sparkle
+    gemMat.diffuse.contents = UIColor(red: 0.92, green: 0.95, blue: 1.0, alpha: 1.0)
+    gemMat.metalness.contents = 0.05
+    gemMat.roughness.contents = 0.02  // Very smooth = sparkly reflections
+    gemMat.transparency = 0.85
+    gemMat.transparencyMode = .dualLayer
+    gemMat.fresnelExponent = 3.0  // Strong edge reflections like a real gem
+    gemMat.specular.contents = UIColor.white
+    gemMat.isDoubleSided = true
+    gemGeo.materials = [gemMat]
+
+    let gemNode = SCNNode(geometry: gemGeo)
+    // Position on top of the band (Z+ = dorsal/top side)
+    gemNode.position = SCNVector3(0, 0, 0.40)
+    // Slightly squash vertically to make it look more like a cut gem
+    gemNode.scale = SCNVector3(1.0, 1.0, 0.7)
+    fallbackNode.addChildNode(gemNode)
+
+    // Small gold prong holders around the gem
+    for angle in stride(from: 0.0, to: 360.0, by: 90.0) {
+      let prong = SCNCylinder(radius: 0.015, height: 0.10)
+      let prongMat = SCNMaterial()
+      prongMat.lightingModel = .physicallyBased
+      prongMat.diffuse.contents = UIColor(red: 0.85, green: 0.65, blue: 0.13, alpha: 1.0)
+      prongMat.metalness.contents = 0.95
+      prongMat.roughness.contents = 0.15
+      prong.materials = [prongMat]
+
+      let prongNode = SCNNode(geometry: prong)
+      let rad = Float(angle) * Float.pi / 180.0
+      let prongDist: Float = Float(gemRadius) * 0.8
+      prongNode.position = SCNVector3(
+        prongDist * cos(rad),
+        prongDist * sin(rad),
+        Float(0.40)
+      )
+      // Align prong along Z axis (pointing up from band)
+      prongNode.eulerAngles = SCNVector3(Float.pi / 2.0, 0, 0)
+      fallbackNode.addChildNode(prongNode)
+    }
 
     fallbackNode.isHidden = true
     ringNode = fallbackNode
     scnView.scene?.rootNode.addChildNode(fallbackNode)
-    print("[JewelryAR] ℹ️ using fallback ring with RED marker on top")
+    print("[JewelryAR] ℹ️ using fallback ring with diamond on top")
   }
 
   // MARK: - MediaPipe setup
