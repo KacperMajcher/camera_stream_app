@@ -86,6 +86,7 @@ class JewelryArView: UIView {
     super.layoutSubviews()
     previewLayer?.frame = bounds
     scnView.frame = bounds
+    debugOverlay.frame = bounds
   }
 
   // MARK: - Camera setup
