@@ -30,6 +30,8 @@ class JewelryArView: UIView {
   // MARK: - Debug overlay
 
   private let debugOverlay = DebugOverlayView()
+  private let debugToggleButton = UIButton(type: .system)
+  private var isDebugVisible = true
 
   // MARK: - MediaPipe
 
@@ -87,6 +89,14 @@ class JewelryArView: UIView {
     previewLayer?.frame = bounds
     scnView.frame = bounds
     debugOverlay.frame = bounds
+    let btnSize: CGFloat = 36
+    let margin: CGFloat = 12
+    debugToggleButton.frame = CGRect(
+      x: bounds.width - btnSize - margin,
+      y: safeAreaInsets.top + margin,
+      width: btnSize,
+      height: btnSize
+    )
   }
 
   // MARK: - Camera setup
@@ -162,6 +172,24 @@ class JewelryArView: UIView {
     debugOverlay.frame = bounds
     debugOverlay.layer.zPosition = 200
     addSubview(debugOverlay)
+
+    // Debug toggle button
+    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
+    debugToggleButton.setImage(UIImage(systemName: "eye.fill", withConfiguration: config), for: .normal)
+    debugToggleButton.tintColor = .white
+    debugToggleButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+    debugToggleButton.layer.cornerRadius = 18
+    debugToggleButton.layer.zPosition = 300
+    debugToggleButton.addTarget(self, action: #selector(toggleDebug), for: .touchUpInside)
+    addSubview(debugToggleButton)
+  }
+
+  @objc private func toggleDebug() {
+    isDebugVisible.toggle()
+    debugOverlay.isHidden = !isDebugVisible
+    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
+    let iconName = isDebugVisible ? "eye.fill" : "eye.slash.fill"
+    debugToggleButton.setImage(UIImage(systemName: iconName, withConfiguration: config), for: .normal)
   }
 
   private func setupFingerOccluder() {
@@ -349,13 +377,12 @@ class JewelryArView: UIView {
 
     framesWithoutDetection = 0
     frameCounter += 1
-
     let now = CACurrentMediaTime()
 
-    // ── Visible area at the fixed Z plane ──
+    // ── Projection constants ──
     let aspect = Float(bounds.width / bounds.height)
     let halfTan = tanf(Float.pi / 6.0) // tan(30°) for 60° FOV SceneKit camera
-    let visH = 2.0 * abs(fixedZ) * halfTan  // ≈ 0.577 scene units
+    let visH = 2.0 * abs(fixedZ) * halfTan
     let visW = visH * aspect
 
     // ── Crop correction for resizeAspectFill ──
@@ -365,32 +392,42 @@ class JewelryArView: UIView {
     let cropX: Float = imageAspect > viewAspect ? imageAspect / viewAspect : 1.0
     let cropY: Float = viewAspect > imageAspect ? viewAspect / imageAspect : 1.0
 
-    // ── 1. POSITION from screen landmarks (crop-corrected) ──
+    // ── Helpers ──
+    func s2(_ i: Int) -> simd_float2 {
+      let sx = (landmarks[i].x - 0.5) * visW * cropX
+      let sy = (0.5 - landmarks[i].y) * visH * cropY
+      return simd_float2(sx, sy)
+    }
+    func w3(_ i: Int) -> simd_float3 {
+      simd_float3(worldLandmarks[i].x, worldLandmarks[i].y, worldLandmarks[i].z)
+    }
+    // MediaPipe Y-down → SceneKit Y-up (negate Y)
+    // MediaPipe Z+ away from camera → SceneKit Z+ toward camera (negate Z)
+    func toSK(_ l: Landmark) -> simd_float3 {
+      simd_float3(l.x, -l.y, -l.z)
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // PHASE 1: POSITION & SCALE  (highest priority)
+    // Source: 2D screen landmarks — stable and directly observed.
+    // Must be applied independently, before any rotation is computed.
+    // ══════════════════════════════════════════════════════════
+
+    // ── 1a. POSITION: midpoint on proximal phalanx (L13 MCP → L14 PIP at t=0.58) ──
     let t: Float = 0.58
     let nx = landmarks[13].x + (landmarks[14].x - landmarks[13].x) * t
     let ny = landmarks[13].y + (landmarks[14].y - landmarks[13].y) * t
     let rawX = (nx - 0.5) * visW * cropX
     let rawY = (0.5 - ny) * visH * cropY
 
-    // ── 2. SCALE: World-screen hybrid (rotation-invariant finger width) ──
-    // World landmarks give true 3D distances in metres, unaffected by viewing angle.
-    // Screen landmarks provide correct perspective scaling for the current distance.
+    // ── 1b. SCALE: rotation-invariant finger width ──
+    // World landmarks give true 3D distances unaffected by viewing angle.
+    // Screen landmarks give perspective-correct projected distances.
     // Combined: worldFingerWidth × (screenRef / worldRef) = finger width in scene units.
-    func w3(_ i: Int) -> simd_float3 {
-      simd_float3(worldLandmarks[i].x, worldLandmarks[i].y, worldLandmarks[i].z)
-    }
-    func s2(_ i: Int) -> simd_float2 {
-      let sx = (landmarks[i].x - 0.5) * visW * cropX
-      let sy = (0.5 - landmarks[i].y) * visH * cropY
-      return simd_float2(sx, sy)
-    }
-
-    // ── Finger width from inter-MCP gap ──
     let worldMCPGap = distance(w3(9), w3(13))
     guard worldMCPGap > 0.001 else { return }
     let worldFingerWidth = worldMCPGap * 0.85
 
-    // Scene-units-per-metre from multiple reference pairs, weighted by screen visibility
     let refs: [(w: Float, s: Float)] = [
       (distance(w3(0), w3(9)),  distance(s2(0), s2(9))),   // wrist → middle MCP
       (distance(w3(5), w3(17)), distance(s2(5), s2(17))),  // index MCP → pinky MCP
@@ -406,30 +443,39 @@ class JewelryArView: UIView {
     guard wTot > 0 else { return }
     let scenePerMetre = wSum / wTot
 
-    // World-screen hybrid (rotation-invariant but may undersize on face-on views)
     let hybridFingerWidth = worldFingerWidth * scenePerMetre
-    // Direct screen-space MCP gap (accurate when hand is flat to camera)
     let screenMCPGap = distance(s2(9), s2(13))
     let screenFingerWidth = screenMCPGap * 0.85
-    // Use the larger: screen is accurate face-on, hybrid is better when rotated
     let fingerWidthScene = max(hybridFingerWidth, screenFingerWidth)
     let rawScale = max(fingerWidthScene / 0.68, 0.003)  // 0.68 = torus inner diameter
 
-    // ── 3. ORIENTATION ──
-    // toSK helper for world landmarks:
-    //   MediaPipe Y-down → SceneKit Y-up (negate Y)
-    //   MediaPipe Z+ away from camera → SceneKit Z+ toward camera (negate Z)
-    func toSK(_ l: Landmark) -> simd_float3 {
-      simd_float3(l.x, -l.y, -l.z)
+    // ── 1c. SMOOTH position and scale (One-Euro filters) ──
+    let smoothX = filterPosX.filter(rawX, at: now)
+    let smoothY = filterPosY.filter(rawY, at: now)
+    let smoothScale = filterScale.filter(rawScale, at: now)
+
+    if frameCounter % 30 == 0 {
+      print("[JewelryAR] 📍 pos=(\(String(format: "%.4f", smoothX)), \(String(format: "%.4f", smoothY))) scale=\(String(format: "%.4f", smoothScale)) bounds=\(bounds.width)x\(bounds.height)")
     }
 
-    // A) DIRECTION (torus axis = along finger): from WORLD bone direction (full 3D)
+    // ── 1d. APPLY position and scale — ring is now on the finger ──
+    ring.position = SCNVector3(smoothX, smoothY, fixedZ)
+    ring.simdScale = simd_float3(repeating: smoothScale)
+    ring.isHidden = false
+
+    // ══════════════════════════════════════════════════════════
+    // PHASE 2: ORIENTATION  (diamond toward dorsal side)
+    // Source: 3D world landmarks — provides depth and facing info.
+    // Applied after position; cannot affect where the ring sits.
+    // ══════════════════════════════════════════════════════════
+
+    // ── 2a. FINGER DIRECTION (torus hole axis): along L13 MCP → L14 PIP ──
     let boneWorld = toSK(worldLandmarks[14]) - toSK(worldLandmarks[13])
     let boneDirLen = simd_length(boneWorld)
     guard boneDirLen > 1e-6 else { return }
     let direction = normalize(boneWorld)
 
-    // Palm normal from WORLD landmarks (only source of depth/facing info)
+    // ── 2b. DORSAL DIRECTION (where diamond points): palm normal ⊥ finger ──
     let sk0 = toSK(worldLandmarks[0])
     let sk5 = toSK(worldLandmarks[5])
     let sk9 = toSK(worldLandmarks[9])
@@ -453,7 +499,7 @@ class JewelryArView: UIView {
     // For right hand, need to negate.
     if !isLeftHand { palmNormal = -palmNormal }
 
-    // Project dorsal-normal ⊥ to finger direction → upVec
+    // Project dorsal normal ⊥ to finger direction → upVec (diamond points here)
     let projNormal = palmNormal - dot(palmNormal, direction) * direction
     let projLen = simd_length(projNormal)
     let upVec: simd_float3
@@ -469,17 +515,10 @@ class JewelryArView: UIView {
       print("[JewelryAR] 🔍 palmN=(\(String(format: "%.2f,%.2f,%.2f", palmNormal.x, palmNormal.y, palmNormal.z))) upVec=(\(String(format: "%.2f,%.2f,%.2f", upVec.x, upVec.y, upVec.z))) projLen=\(String(format: "%.3f", projLen)) isLeft=\(isLeftHand)")
     }
 
-    // Bail if quaternion is invalid (NaN)
     guard targetRotation.real.isFinite else { return }
 
-    // ── 4. SMOOTHING (One-Euro for pos/scale, slerp for rotation) ──
-    let smoothX = filterPosX.filter(rawX, at: now)
-    let smoothY = filterPosY.filter(rawY, at: now)
-    let smoothScale = filterScale.filter(rawScale, at: now)
-
+    // ── 2c. SMOOTH rotation (slerp, shortest path) ──
     if hasSmoothedValues {
-      // Ensure shortest-path slerp: negate target if it's in the opposite hemisphere.
-      // This prevents the ring from taking the "long way around" (180° flip).
       var target = targetRotation
       if simd_dot(smoothedRotation, target) < 0 {
         target = simd_quatf(ix: -target.imag.x, iy: -target.imag.y,
@@ -491,16 +530,10 @@ class JewelryArView: UIView {
       hasSmoothedValues = true
     }
 
-    if frameCounter % 30 == 0 {
-      print("[JewelryAR] 📍 pos=(\(String(format: "%.4f", smoothX)), \(String(format: "%.4f", smoothY))) scale=\(String(format: "%.4f", smoothScale)) bounds=\(bounds.width)x\(bounds.height)")
-    }
-
-    // ── 5. APPLY ──
-    ring.position = SCNVector3(smoothX, smoothY, fixedZ)
+    // ── 2d. APPLY orientation ──
     ring.simdOrientation = smoothedRotation
-    ring.simdScale = simd_float3(repeating: smoothScale)
-    ring.isHidden = false
 
+    // Occluder tracks ring band position and orientation (not gem position)
     occluder.position = ring.position
     occluder.simdOrientation = smoothedRotation
     if let cyl = occluder.geometry as? SCNCylinder {
@@ -511,7 +544,7 @@ class JewelryArView: UIView {
     }
     occluder.isHidden = false
 
-    // ── 6. DEBUG OVERLAY ──
+    // ── DEBUG OVERLAY ──
     var debugData = DebugOverlayData()
     debugData.landmarks = landmarks.map { (CGFloat($0.x), CGFloat($0.y)) }
     debugData.ringNorm = CGPoint(x: CGFloat(nx), y: CGFloat(ny))
