@@ -415,18 +415,21 @@ class JewelryArView: UIView {
     let fingerWidthScene = max(hybridFingerWidth, screenFingerWidth)
     let rawScale = max(fingerWidthScene / 0.68, 0.003)  // 0.68 = torus inner diameter
 
-    // ── 3. ORIENTATION: screen-space finger direction + world palm normal ──
-    // Finger direction from SCREEN landmarks (always matches visible finger on camera)
-    let screenFinger = s2(14) - s2(13)
-    let screenFingerLen = simd_length(screenFinger)
-    guard screenFingerLen > 1e-6 else { return }
-    // Direction in SceneKit XY plane (Z=0 since ring lives on fixed Z-plane)
-    let direction = normalize(simd_float3(screenFinger.x, screenFinger.y, 0))
+    // ── 3. ORIENTATION ──
+    // toSK helper for world landmarks:
+    //   MediaPipe Y-down → SceneKit Y-up (negate Y)
+    //   MediaPipe Z+ away from camera → SceneKit Z+ toward camera (negate Z)
+    func toSK(_ l: Landmark) -> simd_float3 {
+      simd_float3(l.x, -l.y, -l.z)
+    }
+
+    // A) DIRECTION (torus axis = along finger): from WORLD bone direction (full 3D)
+    let boneWorld = toSK(worldLandmarks[14]) - toSK(worldLandmarks[13])
+    let boneDirLen = simd_length(boneWorld)
+    guard boneDirLen > 1e-6 else { return }
+    let direction = normalize(boneWorld)
 
     // Palm normal from WORLD landmarks (only source of depth/facing info)
-    func toSK(_ l: Landmark) -> simd_float3 {
-      simd_float3(l.x, -l.y, l.z)
-    }
     let sk0 = toSK(worldLandmarks[0])
     let sk5 = toSK(worldLandmarks[5])
     let sk9 = toSK(worldLandmarks[9])
@@ -446,20 +449,24 @@ class JewelryArView: UIView {
     guard simd_length(avgPalmCross) > 1e-6 else { return }
 
     var palmNormal = normalize(avgPalmCross)
-    if isLeftHand { palmNormal = -palmNormal }
+    // For left hand, cross product already points toward dorsal.
+    // For right hand, need to negate.
+    if !isLeftHand { palmNormal = -palmNormal }
 
-    // Diamond locked to screen-space perpendicular of finger direction.
-    // Palm normal only determines which side is dorsal (binary sign, immune to noise).
-    let screenPerp = simd_float3(-direction.y, direction.x, 0)  // 90° CCW in XY plane
-    // Project palm normal perpendicular to finger direction and pick the correct side
+    // Project dorsal-normal ⊥ to finger direction → upVec
     let projNormal = palmNormal - dot(palmNormal, direction) * direction
-    let upVec = dot(projNormal, screenPerp) >= 0 ? screenPerp : -screenPerp
+    let projLen = simd_length(projNormal)
+    let upVec: simd_float3
+    if projLen > 0.1 {
+      upVec = projNormal / projLen
+    } else {
+      upVec = normalize(simd_float3(-direction.y, direction.x, 0))
+    }
     let rightVec = normalize(cross(direction, upVec))
     let targetRotation = simd_quaternion(simd_float3x3(rightVec, direction, upVec))
 
-    if frameCounter % 60 == 0 {
-      let dotCam = dot(palmNormal, simd_float3(0, 0, 1))
-      print("[JewelryAR] 🔍 palmNormal·cam = \(String(format: "%.2f", dotCam)) (>0=toward cam, <0=away)")
+    if frameCounter % 30 == 0 {
+      print("[JewelryAR] 🔍 palmN=(\(String(format: "%.2f,%.2f,%.2f", palmNormal.x, palmNormal.y, palmNormal.z))) upVec=(\(String(format: "%.2f,%.2f,%.2f", upVec.x, upVec.y, upVec.z))) projLen=\(String(format: "%.3f", projLen)) isLeft=\(isLeftHand)")
     }
 
     // Bail if quaternion is invalid (NaN)
@@ -520,6 +527,19 @@ class JewelryArView: UIView {
     debugData.screenFW = screenFingerWidth
     debugData.finalScale = smoothScale
     debugData.isCapped = false
+    debugData.upVec3D = upVec
+    debugData.direction3D = direction
+    debugData.rightVec3D = rightVec
+    debugData.smoothedScale = smoothScale
+    // Bone 3D: world finger direction — now same as ring direction (full 3D)
+    debugData.boneDir3D = direction
+    // Bone dorsal: palmNormal projected ⊥ to bone direction (same as upVec now)
+    debugData.boneDorsalDir3D = upVec
+    // Angles for comparison
+    debugData.boneAngleScreen = atan2(direction.y, direction.x) * 180.0 / .pi
+    debugData.boneTiltZ = direction.z
+    debugData.ringAngleScreen = atan2(direction.y, direction.x) * 180.0 / .pi
+    debugData.ringTiltZ = direction.z
     debugOverlay.data = debugData
     debugOverlay.setNeedsDisplay()
   }
@@ -736,6 +756,17 @@ struct DebugOverlayData {
   var screenFW: Float = 0
   var finalScale: Float = 0
   var isCapped: Bool = false
+  var upVec3D: simd_float3 = .zero
+  var direction3D: simd_float3 = .zero    // finger direction (ring Y axis) — SCREEN based
+  var rightVec3D: simd_float3 = .zero     // ring lateral axis (ring X axis)
+  var smoothedScale: Float = 0            // smoothed ring scale for ring outline size
+  // Bone 3D data (world landmarks in SceneKit space) for comparison
+  var boneDir3D: simd_float3 = .zero      // world finger bone direction (13→14)
+  var boneDorsalDir3D: simd_float3 = .zero // palmNormal projected ⊥ bone (where dorsal faces on bone)
+  var boneAngleScreen: Float = 0          // bone angle on screen (atan2)
+  var boneTiltZ: Float = 0                // bone Z tilt (how much finger points toward/away camera)
+  var ringAngleScreen: Float = 0          // ring direction angle on screen
+  var ringTiltZ: Float = 0               // ring Z tilt (always 0 for screen-based direction)
 }
 
 class DebugOverlayView: UIView {
@@ -791,7 +822,19 @@ class DebugOverlayView: UIView {
 
     let pts = lm.enumerated().map { (i, l) in toView(l.x, l.y) }
 
-    // ── 1. Skeleton lines ──
+    // ── 1. Palm surface tint (palm=red, dorsal=green) ──
+    let palmZ = data.palmNormal3D.z
+    let tintColor: UIColor = palmZ > 0
+      ? UIColor.systemGreen.withAlphaComponent(0.15)
+      : UIColor.systemRed.withAlphaComponent(0.15)
+    let palmIndices = [0, 5, 9, 13, 17]  // wrist → index MCP → middle → ring → pinky
+    ctx.setFillColor(tintColor.cgColor)
+    ctx.move(to: pts[palmIndices[0]])
+    for idx in palmIndices.dropFirst() { ctx.addLine(to: pts[idx]) }
+    ctx.closePath()
+    ctx.fillPath()
+
+    // ── 2. Skeleton lines ──
     ctx.setLineWidth(1.5)
     ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.4).cgColor)
     for (a, b) in bones where a < pts.count && b < pts.count {
@@ -800,49 +843,72 @@ class DebugOverlayView: UIView {
     }
     ctx.strokePath()
 
-    // ── 2. Landmark dots ──
+    // ── 3. Ring finger bone highlight (13→14, thick green) ──
+    ctx.setStrokeColor(UIColor.systemGreen.withAlphaComponent(0.9).cgColor)
+    ctx.setLineWidth(4.0)
+    ctx.move(to: pts[13])
+    ctx.addLine(to: pts[14])
+    ctx.strokePath()
+
+    // Finger width perpendicular lines at ring position
+    let ringPt = toView(data.ringNorm.x, data.ringNorm.y)
+    let dir2D = data.direction3D  // SceneKit space (Y up)
+    let dir2Dlen = CGFloat(sqrtf(dir2D.x * dir2D.x + dir2D.y * dir2D.y))
+    if dir2Dlen > 0.01 {
+      // Perpendicular to finger direction in screen space
+      let perpX = CGFloat(-dir2D.y) / dir2Dlen  // rotate 90°
+      let perpY = CGFloat(dir2D.x) / dir2Dlen
+      // Scale: fingerWidth in scene units → approximate pixels (use distance between 13 and 14 on screen as reference)
+      let boneLenPx = hypot(pts[14].x - pts[13].x, pts[14].y - pts[13].y)
+      let widthPx = boneLenPx * 0.6  // approximate finger width relative to bone length
+      let wA = CGPoint(x: ringPt.x + perpX * widthPx / 2, y: ringPt.y - perpY * widthPx / 2)
+      let wB = CGPoint(x: ringPt.x - perpX * widthPx / 2, y: ringPt.y + perpY * widthPx / 2)
+      ctx.setStrokeColor(UIColor.systemYellow.withAlphaComponent(0.7).cgColor)
+      ctx.setLineWidth(2.0)
+      ctx.move(to: wA)
+      ctx.addLine(to: wB)
+      ctx.strokePath()
+    }
+
+    // ── 4. Landmark dots ──
     for (i, pt) in pts.enumerated() {
-      let r: CGFloat = i == 13 || i == 14 ? 6 : 4  // ring finger joints bigger
+      let r: CGFloat = i == 13 || i == 14 ? 6 : 4
       let color = colorForLandmark(i)
       ctx.setFillColor(color.cgColor)
       ctx.fillEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
-      // Dot border
       ctx.setStrokeColor(UIColor.black.withAlphaComponent(0.6).cgColor)
       ctx.setLineWidth(1.0)
       ctx.strokeEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
     }
 
-    // ── 3. Palm normal arrow (cyan) ──
+    // ── 5. Palm normal arrow (cyan) ──
     let palmPt = toView(data.palmCenter.x, data.palmCenter.y)
     let nrm = data.palmNormal3D
     let arrowLen: CGFloat = 60
-    // Project 3D normal to screen: use X directly, flip Y (screen Y is down)
     let nLen = CGFloat(sqrtf(nrm.x * nrm.x + nrm.y * nrm.y))
     if nLen > 0.01 {
       let ndx = CGFloat(nrm.x) / nLen * arrowLen
-      let ndy = CGFloat(nrm.y) / nLen * arrowLen  // already in SceneKit space (Y up → negate for screen)
+      let ndy = CGFloat(nrm.y) / nLen * arrowLen
       let tip = CGPoint(x: palmPt.x + ndx, y: palmPt.y - ndy)
       ctx.setStrokeColor(UIColor.cyan.cgColor)
       ctx.setLineWidth(3.0)
       ctx.move(to: palmPt)
       ctx.addLine(to: tip)
       ctx.strokePath()
-      // Arrowhead
       ctx.setFillColor(UIColor.cyan.cgColor)
       ctx.fillEllipse(in: CGRect(x: tip.x - 4, y: tip.y - 4, width: 8, height: 8))
     }
 
-    // ── 4. Ring orientation axes at ring position ──
-    let ringPt = toView(data.ringNorm.x, data.ringNorm.y)
+    // ── 6. Ring orientation axes ──
     let q = data.ringQuaternion
     let axisLen: CGFloat = 40
-    let axes: [(simd_float3, UIColor)] = [
-      (simd_float3(1, 0, 0), .systemRed),    // right (X)
-      (simd_float3(0, 1, 0), .systemGreen),  // up/finger direction (Y)
-      (simd_float3(0, 0, 1), .systemBlue),   // normal (Z)
+    let axes: [(simd_float3, UIColor, String)] = [
+      (simd_float3(1, 0, 0), .systemRed,   "R"),  // rightVec (X)
+      (simd_float3(0, 1, 0), .systemGreen, "D"),  // direction/finger (Y)
+      (simd_float3(0, 0, 1), .systemBlue,  "U"),  // upVec/dorsal (Z)
     ]
-    for (dir, color) in axes {
-      let rotated = q.act(dir)
+    for (axisDir, color, label) in axes {
+      let rotated = q.act(axisDir)
       let dx = CGFloat(rotated.x) * axisLen
       let dy = CGFloat(rotated.y) * axisLen
       let end = CGPoint(x: ringPt.x + dx, y: ringPt.y - dy)
@@ -851,36 +917,260 @@ class DebugOverlayView: UIView {
       ctx.move(to: ringPt)
       ctx.addLine(to: end)
       ctx.strokePath()
+      // Axis label at tip
+      let labelAttrs: [NSAttributedString.Key: Any] = [
+        .font: UIFont.boldSystemFont(ofSize: 10),
+        .foregroundColor: color,
+      ]
+      (label as NSString).draw(at: CGPoint(x: end.x + 2, y: end.y - 12), withAttributes: labelAttrs)
     }
 
-    // ── 5. Scale debug panel ──
-    let capStr = data.isCapped ? " [CAPPED]" : ""
-    let scaleText = String(format: """
-      MCP: %.4f  Bone cap: %.4f%@
-      Hybrid: %.4f  Screen: %.4f
-      Final: %.4f
-      """, data.mcpWidth, data.boneMaxWidth, capStr,
-      data.hybridFW, data.screenFW, data.finalScale)
+    // ── 7. Diamond direction indicator (yellow diamond shape at upVec tip) ──
+    let upRotated = q.act(simd_float3(0, 0, 1))
+    let diamondDist: CGFloat = axisLen * 1.3
+    let diamondCenter = CGPoint(
+      x: ringPt.x + CGFloat(upRotated.x) * diamondDist,
+      y: ringPt.y - CGFloat(upRotated.y) * diamondDist
+    )
+    let ds: CGFloat = 7  // diamond half-size
+    ctx.setFillColor(UIColor.yellow.withAlphaComponent(0.9).cgColor)
+    ctx.move(to: CGPoint(x: diamondCenter.x, y: diamondCenter.y - ds))      // top
+    ctx.addLine(to: CGPoint(x: diamondCenter.x + ds, y: diamondCenter.y))    // right
+    ctx.addLine(to: CGPoint(x: diamondCenter.x, y: diamondCenter.y + ds))    // bottom
+    ctx.addLine(to: CGPoint(x: diamondCenter.x - ds, y: diamondCenter.y))    // left
+    ctx.closePath()
+    ctx.fillPath()
+    ctx.setStrokeColor(UIColor.black.withAlphaComponent(0.5).cgColor)
+    ctx.setLineWidth(1.0)
+    ctx.move(to: CGPoint(x: diamondCenter.x, y: diamondCenter.y - ds))
+    ctx.addLine(to: CGPoint(x: diamondCenter.x + ds, y: diamondCenter.y))
+    ctx.addLine(to: CGPoint(x: diamondCenter.x, y: diamondCenter.y + ds))
+    ctx.addLine(to: CGPoint(x: diamondCenter.x - ds, y: diamondCenter.y))
+    ctx.closePath()
+    ctx.strokePath()
 
-    let attrs: [NSAttributedString.Key: Any] = [
-      .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .medium),
-      .foregroundColor: UIColor.white,
-    ]
-    let textSize = (scaleText as NSString).boundingRect(
-      with: CGSize(width: 300, height: 200),
-      options: .usesLineFragmentOrigin,
-      attributes: attrs, context: nil).size
+    // ── 8. Projected ring ellipse (magenta, dashed) ──
+    // Project a circle in ring's local XZ plane onto screen
+    let segments = 24
+    // Ring radius in pixels: use finger width line (yellow) as reference
+    // The ring should wrap around the finger, so radius ≈ half of finger width
+    let boneLenPxRef = hypot(pts[14].x - pts[13].x, pts[14].y - pts[13].y)
+    let ringRadPx: CGFloat = boneLenPxRef * 0.35  // ~35% of bone length ≈ finger radius
 
-    let textOrigin = CGPoint(x: bounds.width - textSize.width - 16,
-                             y: bounds.height - textSize.height - 80)
-    // Background
-    let bgRect = CGRect(x: textOrigin.x - 8, y: textOrigin.y - 4,
-                        width: textSize.width + 16, height: textSize.height + 8)
+    ctx.setStrokeColor(UIColor.magenta.withAlphaComponent(0.7).cgColor)
+    ctx.setLineWidth(2.0)
+    ctx.setLineDash(phase: 0, lengths: [6, 4])
+
+    var ellipsePoints: [CGPoint] = []
+    for i in 0...segments {
+      let angle = Float(i) * (2.0 * .pi / Float(segments))
+      // Circle in ring's local XZ plane (Y = finger direction = torus axis)
+      let localPt = simd_float3(cosf(angle), 0, sinf(angle))
+      let rotated = q.act(localPt)
+      // Project to screen: use X directly, flip Y for screen coords
+      let screenPt = CGPoint(
+        x: ringPt.x + CGFloat(rotated.x) * ringRadPx,
+        y: ringPt.y - CGFloat(rotated.y) * ringRadPx
+      )
+      ellipsePoints.append(screenPt)
+    }
+
+    if let first = ellipsePoints.first {
+      ctx.move(to: first)
+      for pt in ellipsePoints.dropFirst() { ctx.addLine(to: pt) }
+      ctx.strokePath()
+    }
+    ctx.setLineDash(phase: 0, lengths: [])  // reset dash
+
+    // ── 9. Palm/Dorsal gauge (top-center) ──
+    let gaugeW: CGFloat = 180
+    let gaugeH: CGFloat = 24
+    let gaugeX = (bounds.width - gaugeW) / 2
+    let gaugeY: CGFloat = 56  // below status bar
+
+    // Background bar
+    let gaugeRect = CGRect(x: gaugeX, y: gaugeY, width: gaugeW, height: gaugeH)
+    let gaugeBg = UIBezierPath(roundedRect: gaugeRect, cornerRadius: 4)
     ctx.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
-    let bgPath = UIBezierPath(roundedRect: bgRect, cornerRadius: 6)
-    ctx.addPath(bgPath.cgPath)
+    ctx.addPath(gaugeBg.cgPath)
     ctx.fillPath()
 
-    (scaleText as NSString).draw(at: textOrigin, withAttributes: attrs)
+    // Left half red gradient, right half green gradient
+    let halfW = gaugeW / 2
+    // Red fill (left side)
+    let redRect = CGRect(x: gaugeX + 2, y: gaugeY + 2, width: halfW - 2, height: gaugeH - 4)
+    ctx.setFillColor(UIColor.systemRed.withAlphaComponent(0.25).cgColor)
+    ctx.fill(redRect)
+    // Green fill (right side)
+    let greenRect = CGRect(x: gaugeX + halfW, y: gaugeY + 2, width: halfW - 2, height: gaugeH - 4)
+    ctx.setFillColor(UIColor.systemGreen.withAlphaComponent(0.25).cgColor)
+    ctx.fill(greenRect)
+
+    // Center line
+    ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.5).cgColor)
+    ctx.setLineWidth(1.0)
+    ctx.move(to: CGPoint(x: gaugeX + halfW, y: gaugeY + 2))
+    ctx.addLine(to: CGPoint(x: gaugeX + halfW, y: gaugeY + gaugeH - 2))
+    ctx.strokePath()
+
+    // Marker dot at palmNormal.z position (clamped -1..1 → 0..gaugeW)
+    let clampedZ = max(-1, min(1, CGFloat(palmZ)))
+    let markerX = gaugeX + halfW + clampedZ * halfW
+    let markerColor: UIColor = palmZ > 0 ? .systemGreen : .systemRed
+    ctx.setFillColor(markerColor.cgColor)
+    ctx.fillEllipse(in: CGRect(x: markerX - 6, y: gaugeY + gaugeH / 2 - 6, width: 12, height: 12))
+    ctx.setStrokeColor(UIColor.white.cgColor)
+    ctx.setLineWidth(1.5)
+    ctx.strokeEllipse(in: CGRect(x: markerX - 6, y: gaugeY + gaugeH / 2 - 6, width: 12, height: 12))
+
+    // Labels
+    let smallAttrs: [NSAttributedString.Key: Any] = [
+      .font: UIFont.boldSystemFont(ofSize: 10),
+      .foregroundColor: UIColor.white,
+    ]
+    ("PALM" as NSString).draw(at: CGPoint(x: gaugeX + 4, y: gaugeY + 4), withAttributes: smallAttrs)
+    ("DORSAL" as NSString).draw(at: CGPoint(x: gaugeX + gaugeW - 48, y: gaugeY + 4), withAttributes: smallAttrs)
+
+    // Z value below gauge
+    let zStr = String(format: "palmN.z: %+.2f", palmZ)
+    let zAttrs: [NSAttributedString.Key: Any] = [
+      .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+      .foregroundColor: markerColor,
+    ]
+    let zSize = (zStr as NSString).size(withAttributes: zAttrs)
+    (zStr as NSString).draw(
+      at: CGPoint(x: (bounds.width - zSize.width) / 2, y: gaugeY + gaugeH + 2),
+      withAttributes: zAttrs
+    )
+
+    // ── 10. Visual 3D gizmos: BONE vs RING side by side ──
+    // Two mini coordinate frames at bottom of screen for direct visual comparison
+    // Isometric-ish projection: X→right, Y→up, Z shown as diagonal + depth cues
+
+    let gizmoR: CGFloat = 55          // arrow length
+    let gizmoPad: CGFloat = 20
+    let gizmoY = bounds.height - 140  // vertical position
+    let gizmoBoneCenter = CGPoint(x: bounds.width * 0.25, y: gizmoY)
+    let gizmoRingCenter = CGPoint(x: bounds.width * 0.75, y: gizmoY)
+
+    // Isometric projection: 3D vec → 2D screen point (relative to center)
+    // Z is shown as diagonal (upper-right = toward camera Z+, lower-left = away Z-)
+    func isoProject(_ v: simd_float3, len: CGFloat) -> CGPoint {
+      let sx = CGFloat(v.x) + CGFloat(v.z) * 0.35
+      let sy = CGFloat(v.y) + CGFloat(v.z) * 0.35
+      let sLen = CGFloat(sqrtf(Float(sx * sx + sy * sy)))
+      if sLen < 0.01 { return .zero }
+      return CGPoint(x: sx / sLen * len, y: -sy / sLen * len)  // -Y for screen coords
+    }
+
+    // Draw a single 3D arrow with depth cues
+    func drawGizmoArrow(_ center: CGPoint, _ vec: simd_float3, _ color: UIColor,
+                        _ label: String, _ arrowLen: CGFloat, dashed: Bool = false) {
+      let proj = isoProject(vec, len: arrowLen)
+      let tip = CGPoint(x: center.x + proj.x, y: center.y + proj.y)
+
+      // Thickness based on how much the vector is in XY vs Z
+      let xyMag = CGFloat(sqrtf(vec.x * vec.x + vec.y * vec.y))
+      let lineW: CGFloat = max(1.5, min(4.0, xyMag * 4.0))
+
+      // Alpha: dimmer if pointing away from camera
+      let alpha: CGFloat = vec.z < -0.3 ? 0.4 : 0.9
+
+      ctx.setStrokeColor(color.withAlphaComponent(alpha).cgColor)
+      ctx.setLineWidth(lineW)
+      if dashed { ctx.setLineDash(phase: 0, lengths: [5, 3]) }
+      ctx.move(to: center)
+      ctx.addLine(to: tip)
+      ctx.strokePath()
+      if dashed { ctx.setLineDash(phase: 0, lengths: []) }
+
+      // Arrowhead triangle
+      let arrowSize: CGFloat = 6
+      let dx = tip.x - center.x, dy = tip.y - center.y
+      let dLen = hypot(dx, dy)
+      if dLen > 1 {
+        let ux = dx / dLen, uy = dy / dLen
+        let px = -uy, py = ux  // perpendicular
+        let base = CGPoint(x: tip.x - ux * arrowSize, y: tip.y - uy * arrowSize)
+        ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
+        ctx.move(to: tip)
+        ctx.addLine(to: CGPoint(x: base.x + px * arrowSize * 0.5,
+                                y: base.y + py * arrowSize * 0.5))
+        ctx.addLine(to: CGPoint(x: base.x - px * arrowSize * 0.5,
+                                y: base.y - py * arrowSize * 0.5))
+        ctx.closePath()
+        ctx.fillPath()
+      }
+
+      // Z depth indicator at tip
+      let zStr = String(format: "%@ z%+.1f", label, vec.z)
+      let lAttrs: [NSAttributedString.Key: Any] = [
+        .font: UIFont.boldSystemFont(ofSize: 9),
+        .foregroundColor: color.withAlphaComponent(alpha),
+      ]
+      (zStr as NSString).draw(at: CGPoint(x: tip.x + 3, y: tip.y - 10), withAttributes: lAttrs)
+    }
+
+    // ── Gizmo backgrounds ──
+    for (center, title) in [(gizmoBoneCenter, "BONE 3D"), (gizmoRingCenter, "RING")] {
+      // Circle background
+      let bgR = gizmoR + 20
+      ctx.setFillColor(UIColor.black.withAlphaComponent(0.5).cgColor)
+      ctx.fillEllipse(in: CGRect(x: center.x - bgR, y: center.y - bgR,
+                                 width: bgR * 2, height: bgR * 2))
+      ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.3).cgColor)
+      ctx.setLineWidth(1.0)
+      ctx.strokeEllipse(in: CGRect(x: center.x - bgR, y: center.y - bgR,
+                                   width: bgR * 2, height: bgR * 2))
+      // Title
+      let tAttrs: [NSAttributedString.Key: Any] = [
+        .font: UIFont.boldSystemFont(ofSize: 11),
+        .foregroundColor: UIColor.white,
+      ]
+      let tSize = (title as NSString).size(withAttributes: tAttrs)
+      (title as NSString).draw(
+        at: CGPoint(x: center.x - tSize.width / 2, y: center.y - bgR - 16),
+        withAttributes: tAttrs)
+      // Center dot
+      ctx.setFillColor(UIColor.white.withAlphaComponent(0.5).cgColor)
+      ctx.fillEllipse(in: CGRect(x: center.x - 3, y: center.y - 3, width: 6, height: 6))
+    }
+
+    // ── BONE gizmo (left) — world 3D from landmarks ──
+    let bd = data.boneDir3D
+    let bdd = data.boneDorsalDir3D
+    let boneLateral = simd_length(cross(bd, bdd)) > 0.1
+      ? normalize(cross(bd, bdd)) : simd_float3(1, 0, 0)
+
+    drawGizmoArrow(gizmoBoneCenter, bd,  .systemGreen,  "dir", gizmoR)      // finger direction
+    drawGizmoArrow(gizmoBoneCenter, bdd, .systemBlue,   "drs", gizmoR * 0.8) // dorsal
+    drawGizmoArrow(gizmoBoneCenter, boneLateral, .systemRed, "lat", gizmoR * 0.6) // lateral
+
+    // ── RING gizmo (right) — what's actually applied ──
+    let rd = data.direction3D
+    let ru = data.upVec3D
+    let rr = data.rightVec3D
+
+    drawGizmoArrow(gizmoRingCenter, rd, .systemGreen, "dir", gizmoR)       // ring Y (finger)
+    drawGizmoArrow(gizmoRingCenter, ru, .systemBlue,  "up",  gizmoR * 0.8) // ring Z (diamond)
+    drawGizmoArrow(gizmoRingCenter, rr, .systemRed,   "R",   gizmoR * 0.6) // ring X (lateral)
+
+    // ── Minimal stats below gizmos ──
+    let pn = data.palmNormal3D
+    let sideLabel = pn.z > 0 ? "DORSAL" : "PALM"
+    let statsStr = String(format: "Palm Z: %+.2f [%@]  scale: %.3f  Δang: %+.1f°",
+      pn.z, sideLabel, data.finalScale,
+      data.ringAngleScreen - data.boneAngleScreen)
+    let sAttrs: [NSAttributedString.Key: Any] = [
+      .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+      .foregroundColor: UIColor.white,
+    ]
+    let sSize = (statsStr as NSString).size(withAttributes: sAttrs)
+    let statsX = (bounds.width - sSize.width) / 2
+    let statsY = gizmoY + gizmoR + 30
+    // Background
+    ctx.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+    ctx.fill(CGRect(x: statsX - 6, y: statsY - 2, width: sSize.width + 12, height: sSize.height + 4))
+    (statsStr as NSString).draw(at: CGPoint(x: statsX, y: statsY), withAttributes: sAttrs)
   }
 }
