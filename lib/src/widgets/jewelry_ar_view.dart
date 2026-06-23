@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 
 /// Native platform view that composites:
 ///   - Live camera feed (AVCapture on iOS, CameraX on Android)
-///   - 3D ring model (SceneKit on iOS, Sceneview/Filament on Android)
+///   - Top-down ring image overlay on iOS
 ///   - MediaPipe Hands for real-time 3D landmark detection
 ///
 /// All heavy processing stays on the native side; Flutter only receives
@@ -18,7 +18,7 @@ class JewelryArView extends StatelessWidget {
 
   const JewelryArView({
     super.key,
-    this.modelAsset = 'assets/ring.glb',
+    this.modelAsset = 'assets/ring.avif',
     this.ringSize = 3,
     this.onPlatformViewCreated,
   });

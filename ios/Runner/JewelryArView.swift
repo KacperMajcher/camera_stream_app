@@ -1,14 +1,12 @@
 import AVFoundation
 import Flutter
 import MediaPipeTasksVision
-import SceneKit
+import simd
 import UIKit
-import ModelIO
-import SceneKit.ModelIO
 
 /// Native UIView that composites:
 ///   1. AVCaptureVideoPreviewLayer (camera feed)
-///   2. SCNView (3D ring rendered via SceneKit)
+///   2. UIImageView (top-down ring image overlay)
 ///   3. MediaPipe Hands (real-time 3D landmark detection)
 ///
 /// Landmark events are streamed back to Flutter via EventChannel.
@@ -21,11 +19,14 @@ class JewelryArView: UIView {
   private let videoOutput = AVCaptureVideoDataOutput()
   private let videoQueue = DispatchQueue(label: "com.jewelry.videoQueue", qos: .userInteractive)
 
-  // MARK: - SceneKit
+  // MARK: - Top-down ring image
 
-  private let scnView = SCNView()
-  private var ringNode: SCNNode?
-  private var fingerOccluderNode: SCNNode?
+  private let ringImageView = UIImageView()
+  private var ringImageAspect: CGFloat = 1.0
+  private var lastRingCenter: CGPoint?
+  private var lastRingWidth: CGFloat?
+  private var lastDorsalScore: Float = 0
+  private let dorsalFacingThreshold: Float = 0.22
 
   // MARK: - Debug overlay
 
@@ -64,7 +65,7 @@ class JewelryArView: UIView {
   // MARK: - Init
 
   init(frame: CGRect, viewId: Int64, args: [String: Any], messenger: FlutterBinaryMessenger) {
-    modelAsset = args["modelAsset"] as? String ?? "assets/ring.glb"
+    modelAsset = args["modelAsset"] as? String ?? "assets/ring.avif"
     ringSize = args["ringSize"] as? Int ?? 3
 
     eventChannel = FlutterEventChannel(
@@ -76,7 +77,7 @@ class JewelryArView: UIView {
 
     eventChannel.setStreamHandler(self)
     setupCamera()
-    setupSceneKit()
+    setupRingOverlay()
     setupMediaPipe()
   }
 
@@ -87,7 +88,6 @@ class JewelryArView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     previewLayer?.frame = bounds
-    scnView.frame = bounds
     debugOverlay.frame = bounds
     let btnSize: CGFloat = 36
     let margin: CGFloat = 12
@@ -143,30 +143,16 @@ class JewelryArView: UIView {
     }
   }
 
-  // MARK: - SceneKit setup
+  // MARK: - Ring overlay setup
 
-  private func setupSceneKit() {
-    scnView.frame = bounds
-    scnView.backgroundColor = .clear
-    scnView.scene = SCNScene()
-    scnView.autoenablesDefaultLighting = true // Faster for debugging
-    scnView.allowsCameraControl = false
-    scnView.isPlaying = true
-    scnView.layer.zPosition = 100 // Ensure it is above the preview layer
-    addSubview(scnView)
-
-    // Camera node matching roughly a phone back-camera FOV (~60°)
-    let cameraNode = SCNNode()
-    cameraNode.camera = SCNCamera()
-    cameraNode.camera?.fieldOfView = 60
-    cameraNode.camera?.zNear = 0.01 // Increased to avoid clipping
-    cameraNode.camera?.zFar = 10
-    cameraNode.position = SCNVector3(0, 0, 0)
-    scnView.scene?.rootNode.addChildNode(cameraNode)
-    scnView.pointOfView = cameraNode
-
-    loadRingModel()
-    setupFingerOccluder()
+  private func setupRingOverlay() {
+    ringImageView.frame = bounds
+    ringImageView.backgroundColor = .clear
+    ringImageView.contentMode = .scaleAspectFit
+    ringImageView.isHidden = true
+    ringImageView.layer.zPosition = 100
+    ringImageView.image = loadRingImage()
+    addSubview(ringImageView)
 
     // Debug overlay on top of everything
     debugOverlay.frame = bounds
@@ -184,141 +170,50 @@ class JewelryArView: UIView {
     addSubview(debugToggleButton)
   }
 
+  private func loadRingImage() -> UIImage? {
+    print("[JewelryAR] ℹ️ loadRingImage called with asset: \(modelAsset)")
+    let assetKey = FlutterDartProject.lookupKey(forAsset: modelAsset)
+    guard let bundlePath = Bundle.main.path(forResource: assetKey, ofType: nil),
+          let image = UIImage(contentsOfFile: bundlePath)
+    else {
+      print("[JewelryAR] ❌ ring image not found at asset key: \(assetKey)")
+      return nil
+    }
+
+    let processed = image.withWhiteBackgroundRemoved()
+    ringImageAspect = max(processed.size.width / max(processed.size.height, 1), 0.1)
+    print("[JewelryAR] ✅ ring image loaded \(Int(processed.size.width))x\(Int(processed.size.height))")
+    return processed
+  }
+
+  private func normalizedToViewPoint(x nx: CGFloat, y ny: CGFloat) -> CGPoint {
+    // MediaPipe receives the same portrait camera buffer that previewLayer shows as aspect-fill.
+    let imgW: CGFloat = 720
+    let imgH: CGFloat = 1280
+    let scale = max(bounds.width / imgW, bounds.height / imgH)
+    let projectedW = imgW * scale
+    let projectedH = imgH * scale
+    let offsetX = (projectedW - bounds.width) / 2
+    let offsetY = (projectedH - bounds.height) / 2
+    return CGPoint(x: nx * projectedW - offsetX, y: ny * projectedH - offsetY)
+  }
+
+  private func ringSizeMultiplier(for size: Int) -> CGFloat {
+    switch size {
+    case 1: return 0.88
+    case 2: return 0.94
+    case 4: return 1.06
+    case 5: return 1.12
+    default: return 1.0
+    }
+  }
+
   @objc private func toggleDebug() {
     isDebugVisible.toggle()
     debugOverlay.isHidden = !isDebugVisible
     let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)
     let iconName = isDebugVisible ? "eye.fill" : "eye.slash.fill"
     debugToggleButton.setImage(UIImage(systemName: iconName, withConfiguration: config), for: .normal)
-  }
-
-  private func setupFingerOccluder() {
-    // Invisible occluder: writes only to depth buffer, no color output.
-    let geometry = SCNCylinder(radius: 0.01, height: 0.03) // Larger initial size
-    let material = SCNMaterial()
-    material.diffuse.contents = UIColor.black
-    material.colorBufferWriteMask = []
-    material.writesToDepthBuffer = true
-    material.readsFromDepthBuffer = true
-    material.isDoubleSided = true
-    geometry.materials = [material]
-
-    let node = SCNNode(geometry: geometry)
-    node.renderingOrder = -10
-    node.isHidden = true
-    fingerOccluderNode = node
-    scnView.scene?.rootNode.addChildNode(node)
-  }
-
-  private func loadRingModel() {
-    print("[JewelryAR] ℹ️ loadRingModel called with asset: \(modelAsset)")
-    let assetKey = FlutterDartProject.lookupKey(forAsset: modelAsset)
-    guard let bundlePath = Bundle.main.path(forResource: assetKey, ofType: nil) else {
-      print("[JewelryAR] ❌ ring model not found at asset key: \(assetKey)")
-      buildFallbackRing()
-      return
-    }
-    let url = URL(fileURLWithPath: bundlePath)
-
-    do {
-      let mdlAsset = MDLAsset(url: url)
-      mdlAsset.loadTextures()
-      let modelScene = SCNScene(mdlAsset: mdlAsset)
-      
-      let containerNode = SCNNode()
-      for child in modelScene.rootNode.childNodes {
-        containerNode.addChildNode(child)
-      }
-      
-      if containsGeometry(node: containerNode) {
-        containerNode.isHidden = true
-        ringNode = containerNode
-        scnView.scene?.rootNode.addChildNode(containerNode)
-        print("[JewelryAR] ✅ ring model loaded successfully from GLB")
-      } else {
-        print("[JewelryAR] ❌ GLB has no geometry, using fallback")
-        buildFallbackRing()
-      }
-    } catch {
-      print("[JewelryAR] ❌ Error loading GLB: \(error)")
-      buildFallbackRing()
-    }
-  }
-
-  private func containsGeometry(node: SCNNode) -> Bool {
-    if node.geometry != nil { return true }
-    for child in node.childNodes {
-      if containsGeometry(node: child) { return true }
-    }
-    return false
-  }
-
-  private func buildFallbackRing() {
-    // Thinner band: pipeRadius 0.06 (was 0.10)
-    let torus = SCNTorus(ringRadius: 0.40, pipeRadius: 0.06)
-    let bandMaterial = SCNMaterial()
-    bandMaterial.lightingModel = .physicallyBased
-    bandMaterial.diffuse.contents = UIColor(red: 0.85, green: 0.65, blue: 0.13, alpha: 1.0)
-    bandMaterial.metalness.contents = 0.95
-    bandMaterial.roughness.contents = 0.15
-    bandMaterial.isDoubleSided = true
-    torus.materials = [bandMaterial]
-
-    let fallbackNode = SCNNode(geometry: torus)
-
-    // ── Diamond / gem on top (Z+ in model space = dorsal side of finger) ──
-    // Multi-faceted gem using SCNSphere with low segment count for faceted look
-    let gemRadius: CGFloat = 0.12
-    let gemGeo = SCNSphere(radius: gemRadius)
-    gemGeo.segmentCount = 8  // Low segment count = faceted diamond look
-
-    let gemMat = SCNMaterial()
-    gemMat.lightingModel = .physicallyBased
-    // Slightly blue-white diamond color with high transparency/sparkle
-    gemMat.diffuse.contents = UIColor(red: 0.92, green: 0.95, blue: 1.0, alpha: 1.0)
-    gemMat.metalness.contents = 0.05
-    gemMat.roughness.contents = 0.02  // Very smooth = sparkly reflections
-    gemMat.transparency = 0.85
-    gemMat.transparencyMode = .dualLayer
-    gemMat.fresnelExponent = 3.0  // Strong edge reflections like a real gem
-    gemMat.specular.contents = UIColor.white
-    gemMat.isDoubleSided = true
-    gemGeo.materials = [gemMat]
-
-    let gemNode = SCNNode(geometry: gemGeo)
-    // Position on top of the band (Z+ = dorsal/top side)
-    gemNode.position = SCNVector3(0, 0, 0.40)
-    // Slightly squash vertically to make it look more like a cut gem
-    gemNode.scale = SCNVector3(1.0, 1.0, 0.7)
-    fallbackNode.addChildNode(gemNode)
-
-    // Small gold prong holders around the gem
-    for angle in stride(from: 0.0, to: 360.0, by: 90.0) {
-      let prong = SCNCylinder(radius: 0.015, height: 0.10)
-      let prongMat = SCNMaterial()
-      prongMat.lightingModel = .physicallyBased
-      prongMat.diffuse.contents = UIColor(red: 0.85, green: 0.65, blue: 0.13, alpha: 1.0)
-      prongMat.metalness.contents = 0.95
-      prongMat.roughness.contents = 0.15
-      prong.materials = [prongMat]
-
-      let prongNode = SCNNode(geometry: prong)
-      let rad = Float(angle) * Float.pi / 180.0
-      let prongDist: Float = Float(gemRadius) * 0.8
-      prongNode.position = SCNVector3(
-        prongDist * cos(rad),
-        prongDist * sin(rad),
-        Float(0.40)
-      )
-      // Align prong along Z axis (pointing up from band)
-      prongNode.eulerAngles = SCNVector3(Float.pi / 2.0, 0, 0)
-      fallbackNode.addChildNode(prongNode)
-    }
-
-    fallbackNode.isHidden = true
-    ringNode = fallbackNode
-    scnView.scene?.rootNode.addChildNode(fallbackNode)
-    print("[JewelryAR] ℹ️ using fallback ring with diamond on top")
   }
 
   // MARK: - MediaPipe setup
@@ -351,27 +246,18 @@ class JewelryArView: UIView {
     }
   }
 
-  // MARK: - Ring positioning (world-screen hybrid approach)
+  // MARK: - Ring image positioning
   //
-  // Position from SCREEN landmarks (with resizeAspectFill crop correction).
-  // Scale from WORLD finger width × screen-space pixels-per-meter ratio
-  //   → rotation-invariant: world gives true finger width, screen gives perspective.
-  // Orientation from WORLD landmarks (3D finger tilt).
-  //
-  // The ring lives at a fixed Z plane in SceneKit; apparent size changes
-  // come from the screen-space reference scaling with distance.
+  // Position and scale come from screen landmarks so the overlay sticks to the
+  // camera preview. Dorsal/palm classification still comes from world landmarks.
 
   private var frameCounter = 0
-
-  // Fixed depth plane – ring always sits here; perspective from screen coords.
-  private let fixedZ: Float = -0.5
 
   private func updateRingPosition(
     landmarks: [NormalizedLandmark],
     worldLandmarks: [Landmark],
     isLeftHand: Bool
   ) {
-    guard let ring = ringNode, let occluder = fingerOccluderNode else { return }
     guard landmarks.count > 17, worldLandmarks.count > 17 else { return }
     guard bounds.width > 0, bounds.height > 0 else { return }
 
@@ -379,103 +265,32 @@ class JewelryArView: UIView {
     frameCounter += 1
     let now = CACurrentMediaTime()
 
-    // ── Projection constants ──
-    let aspect = Float(bounds.width / bounds.height)
-    let halfTan = tanf(Float.pi / 6.0) // tan(30°) for 60° FOV SceneKit camera
-    let visH = 2.0 * abs(fixedZ) * halfTan
-    let visW = visH * aspect
-
-    // ── Crop correction for resizeAspectFill ──
-    // Camera preset 1280×720 → portrait 720×1280. The preview may crop width.
-    let imageAspect: Float = 720.0 / 1280.0
-    let viewAspect = Float(bounds.width / bounds.height)
-    let cropX: Float = imageAspect > viewAspect ? imageAspect / viewAspect : 1.0
-    let cropY: Float = viewAspect > imageAspect ? viewAspect / imageAspect : 1.0
-
     // ── Helpers ──
-    func s2(_ i: Int) -> simd_float2 {
-      let sx = (landmarks[i].x - 0.5) * visW * cropX
-      let sy = (0.5 - landmarks[i].y) * visH * cropY
-      return simd_float2(sx, sy)
+    func v2(_ i: Int) -> CGPoint {
+      normalizedToViewPoint(x: CGFloat(landmarks[i].x), y: CGFloat(landmarks[i].y))
     }
     func w3(_ i: Int) -> simd_float3 {
       simd_float3(worldLandmarks[i].x, worldLandmarks[i].y, worldLandmarks[i].z)
     }
-    // MediaPipe Y-down → SceneKit Y-up (negate Y)
-    // MediaPipe Z+ away from camera → SceneKit Z+ toward camera (negate Z)
+    // MediaPipe Y-down → view-space Y-up (negate Y)
+    // MediaPipe Z+ away from camera → camera-facing Z+ (negate Z)
     func toSK(_ l: Landmark) -> simd_float3 {
       simd_float3(l.x, -l.y, -l.z)
     }
 
-    // ══════════════════════════════════════════════════════════
-    // PHASE 1: POSITION & SCALE  (highest priority)
-    // Source: 2D screen landmarks — stable and directly observed.
-    // Must be applied independently, before any rotation is computed.
-    // ══════════════════════════════════════════════════════════
-
-    // ── 1a. POSITION: midpoint on proximal phalanx (L13 MCP → L14 PIP at t=0.58) ──
+    // ── 1. POSITION: midpoint on proximal phalanx (L13 MCP → L14 PIP at t=0.58) ──
     let t: Float = 0.58
     let nx = landmarks[13].x + (landmarks[14].x - landmarks[13].x) * t
     let ny = landmarks[13].y + (landmarks[14].y - landmarks[13].y) * t
-    let rawX = (nx - 0.5) * visW * cropX
-    let rawY = (0.5 - ny) * visH * cropY
+    let rawCenter = normalizedToViewPoint(x: CGFloat(nx), y: CGFloat(ny))
 
-    // ── 1b. SCALE: rotation-invariant finger width ──
-    // World landmarks give true 3D distances unaffected by viewing angle.
-    // Screen landmarks give perspective-correct projected distances.
-    // Combined: worldFingerWidth × (screenRef / worldRef) = finger width in scene units.
-    let worldMCPGap = distance(w3(9), w3(13))
-    guard worldMCPGap > 0.001 else { return }
-    let worldFingerWidth = worldMCPGap * 0.85
-
-    let refs: [(w: Float, s: Float)] = [
-      (distance(w3(0), w3(9)),  distance(s2(0), s2(9))),   // wrist → middle MCP
-      (distance(w3(5), w3(17)), distance(s2(5), s2(17))),  // index MCP → pinky MCP
-      (distance(w3(0), w3(5)),  distance(s2(0), s2(5))),   // wrist → index MCP
-      (distance(w3(0), w3(17)), distance(s2(0), s2(17))),  // wrist → pinky MCP
-    ]
-    var wSum: Float = 0, wTot: Float = 0
-    for r in refs where r.w > 0.005 {
-      let weight = r.s * r.s  // heavier weight for more visible (less foreshortened) pairs
-      wSum += weight * (r.s / r.w)
-      wTot += weight
-    }
-    guard wTot > 0 else { return }
-    let scenePerMetre = wSum / wTot
-
-    let hybridFingerWidth = worldFingerWidth * scenePerMetre
-    let screenMCPGap = distance(s2(9), s2(13))
-    let screenFingerWidth = screenMCPGap * 0.85
-    let fingerWidthScene = max(hybridFingerWidth, screenFingerWidth)
-    let rawScale = max(fingerWidthScene / 0.68, 0.003)  // 0.68 = torus inner diameter
-
-    // ── 1c. SMOOTH position and scale (One-Euro filters) ──
-    let smoothX = filterPosX.filter(rawX, at: now)
-    let smoothY = filterPosY.filter(rawY, at: now)
-    let smoothScale = filterScale.filter(rawScale, at: now)
-
-    if frameCounter % 30 == 0 {
-      print("[JewelryAR] 📍 pos=(\(String(format: "%.4f", smoothX)), \(String(format: "%.4f", smoothY))) scale=\(String(format: "%.4f", smoothScale)) bounds=\(bounds.width)x\(bounds.height)")
-    }
-
-    // ── 1d. APPLY position and scale — ring is now on the finger ──
-    ring.position = SCNVector3(smoothX, smoothY, fixedZ)
-    ring.simdScale = simd_float3(repeating: smoothScale)
-    ring.isHidden = false
-
-    // ══════════════════════════════════════════════════════════
-    // PHASE 2: ORIENTATION  (diamond toward dorsal side)
-    // Source: 3D world landmarks — provides depth and facing info.
-    // Applied after position; cannot affect where the ring sits.
-    // ══════════════════════════════════════════════════════════
-
-    // ── 2a. FINGER DIRECTION (torus hole axis): along L13 MCP → L14 PIP ──
+    // ── 2. FINGER DIRECTION: along L13 MCP → L14 PIP ──
     let boneWorld = toSK(worldLandmarks[14]) - toSK(worldLandmarks[13])
     let boneDirLen = simd_length(boneWorld)
     guard boneDirLen > 1e-6 else { return }
     let direction = normalize(boneWorld)
 
-    // ── 2b. DORSAL DIRECTION (where diamond points): palm normal ⊥ finger ──
+    // ── 3. DORSAL DIRECTION: use palm normal to show image only for dorsal-facing hand ──
     let sk0 = toSK(worldLandmarks[0])
     let sk5 = toSK(worldLandmarks[5])
     let sk9 = toSK(worldLandmarks[9])
@@ -499,6 +314,9 @@ class JewelryArView: UIView {
     // For right hand, need to negate.
     if !isLeftHand { palmNormal = -palmNormal }
 
+    let isDorsalFacingCamera = palmNormal.z > dorsalFacingThreshold
+    lastDorsalScore = palmNormal.z
+
     // Project dorsal normal ⊥ to finger direction → upVec (diamond points here)
     let projNormal = palmNormal - dot(palmNormal, direction) * direction
     let projLen = simd_length(projNormal)
@@ -512,7 +330,7 @@ class JewelryArView: UIView {
     let targetRotation = simd_quaternion(simd_float3x3(rightVec, direction, upVec))
 
     if frameCounter % 30 == 0 {
-      print("[JewelryAR] 🔍 palmN=(\(String(format: "%.2f,%.2f,%.2f", palmNormal.x, palmNormal.y, palmNormal.z))) upVec=(\(String(format: "%.2f,%.2f,%.2f", upVec.x, upVec.y, upVec.z))) projLen=\(String(format: "%.3f", projLen)) isLeft=\(isLeftHand)")
+      print("[JewelryAR] 🔍 palmN=(\(String(format: "%.2f,%.2f,%.2f", palmNormal.x, palmNormal.y, palmNormal.z))) dorsal=\(isDorsalFacingCamera) isLeft=\(isLeftHand)")
     }
 
     guard targetRotation.real.isFinite else { return }
@@ -530,19 +348,50 @@ class JewelryArView: UIView {
       hasSmoothedValues = true
     }
 
-    // ── 2d. APPLY orientation ──
-    ring.simdOrientation = smoothedRotation
+    // ── 5. APPLY top-down image overlay ──
+    let p13 = v2(13)
+    let p14 = v2(14)
+    let p9 = v2(9)
+    let ringBonePx = hypot(p14.x - p13.x, p14.y - p13.y)
+    let mcpGapPx = hypot(p13.x - p9.x, p13.y - p9.y)
+    let mcpFingerWidthPx = mcpGapPx * 0.78
+    let boneFallbackWidthPx = ringBonePx * 0.42
+    let fingerWidthPx = max(mcpFingerWidthPx, boneFallbackWidthPx)
+    let sizeMultiplier = ringSizeMultiplier(for: ringSize)
+    let outerRingToFingerWidth: CGFloat = 1.18
+    let rawImageWidth = max(Float(fingerWidthPx * outerRingToFingerWidth * sizeMultiplier), 12)
 
-    // Occluder tracks ring band position and orientation (not gem position)
-    occluder.position = ring.position
-    occluder.simdOrientation = smoothedRotation
-    if let cyl = occluder.geometry as? SCNCylinder {
-      // Radius must nearly fill the torus interior (ringRadius=0.40) so the
-      // back half of the ring is hidden behind the "finger" depth mask.
-      cyl.radius = CGFloat(smoothScale * 0.38)
-      cyl.height = CGFloat(smoothScale * 2.0)
+    let smoothX = filterPosX.filter(Float(rawCenter.x), at: now)
+    let smoothY = filterPosY.filter(Float(rawCenter.y), at: now)
+    let smoothImageWidth = filterScale.filter(rawImageWidth, at: now)
+    let imageWidth = CGFloat(smoothImageWidth)
+    let imageHeight = imageWidth / ringImageAspect
+
+    if isDorsalFacingCamera {
+      let fingerAngle = atan2(p14.y - p13.y, p14.x - p13.x)
+      let ringImageAngle = fingerAngle + (.pi / 2.0)
+      let dorsalAlpha = CGFloat(min(1, max(0.35, (palmNormal.z - dorsalFacingThreshold) / 0.35)))
+      let horizontalAnchorCorrection = imageWidth * (isLeftHand ? 0.07 : -0.04)
+
+      ringImageView.bounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
+      ringImageView.center = CGPoint(
+        x: CGFloat(smoothX) + horizontalAnchorCorrection,
+        y: CGFloat(smoothY)
+      )
+      ringImageView.transform = CGAffineTransform(rotationAngle: ringImageAngle)
+      ringImageView.alpha = dorsalAlpha
+      ringImageView.isHidden = ringImageView.image == nil
+      lastRingCenter = ringImageView.center
+      lastRingWidth = imageWidth
+    } else {
+      ringImageView.isHidden = true
+      lastRingCenter = nil
+      lastRingWidth = nil
     }
-    occluder.isHidden = false
+
+    if frameCounter % 30 == 0 {
+      print("[JewelryAR] 📍 img=(\(String(format: "%.1f", smoothX)), \(String(format: "%.1f", smoothY))) width=\(String(format: "%.1f", smoothImageWidth)) bounds=\(bounds.width)x\(bounds.height)")
+    }
 
     // ── DEBUG OVERLAY ──
     var debugData = DebugOverlayData()
@@ -554,16 +403,16 @@ class JewelryArView: UIView {
       x: CGFloat((landmarks[0].x + landmarks[5].x + landmarks[9].x + landmarks[13].x + landmarks[17].x) / 5.0),
       y: CGFloat((landmarks[0].y + landmarks[5].y + landmarks[9].y + landmarks[13].y + landmarks[17].y) / 5.0)
     )
-    debugData.mcpWidth = worldFingerWidth
+    debugData.mcpWidth = Float(mcpGapPx)
     debugData.boneMaxWidth = 0  // no cap
-    debugData.hybridFW = hybridFingerWidth
-    debugData.screenFW = screenFingerWidth
-    debugData.finalScale = smoothScale
+    debugData.hybridFW = Float(fingerWidthPx)
+    debugData.screenFW = Float(ringBonePx)
+    debugData.finalScale = smoothImageWidth
     debugData.isCapped = false
     debugData.upVec3D = upVec
     debugData.direction3D = direction
     debugData.rightVec3D = rightVec
-    debugData.smoothedScale = smoothScale
+    debugData.smoothedScale = smoothImageWidth
     // Bone 3D: world finger direction — now same as ring direction (full 3D)
     debugData.boneDir3D = direction
     // Bone dorsal: palmNormal projected ⊥ to bone direction (same as upVec now)
@@ -575,14 +424,6 @@ class JewelryArView: UIView {
     debugData.ringTiltZ = direction.z
     debugOverlay.data = debugData
     debugOverlay.setNeedsDisplay()
-  }
-
-  private func lerpVec3(_ a: SCNVector3, _ b: SCNVector3, t: Float) -> SCNVector3 {
-    return SCNVector3(
-      a.x + (b.x - a.x) * t,
-      a.y + (b.y - a.y) * t,
-      a.z + (b.z - a.z) * t
-    )
   }
 
   // MARK: - Send landmarks to Flutter
@@ -603,19 +444,18 @@ class JewelryArView: UIView {
       ]
     }
 
-    var eventData: [String: Any] = ["landmarks": jointsMap]
-    
-    // Add ring transform data if available
-    if let ring = ringNode, !ring.isHidden {
-      eventData["ringPosition"] = [
-        "x": Double(ring.position.x),
-        "y": Double(ring.position.y),
-        "z": Double(ring.position.z)
-      ]
-      eventData["ringScale"] = Double(ring.scale.x)
-    }
-
     DispatchQueue.main.async {
+      var eventData: [String: Any] = ["landmarks": jointsMap]
+      if let center = self.lastRingCenter,
+         let width = self.lastRingWidth,
+         !self.ringImageView.isHidden {
+        eventData["ringPosition"] = [
+          "x": Double(center.x),
+          "y": Double(center.y),
+          "z": Double(self.lastDorsalScore)
+        ]
+        eventData["ringScale"] = Double(width)
+      }
       sink(eventData)
     }
   }
@@ -628,8 +468,9 @@ class JewelryArView: UIView {
       return
     }
 
-    ringNode?.isHidden = true
-    fingerOccluderNode?.isHidden = true
+    ringImageView.isHidden = true
+    lastRingCenter = nil
+    lastRingWidth = nil
     // Reset all filter state so re-acquisition starts fresh
     hasSmoothedValues = false
     filterPosX.reset()
@@ -697,7 +538,7 @@ extension JewelryArView: HandLandmarkerLiveStreamDelegate {
       print("[JewelryAR] ✅ \(handedness.categoryName) hand detected")
     }
 
-    // Update 3D ring position on main thread (SceneKit)
+    // Update ring image position on main thread
     DispatchQueue.main.async { [weak self] in
       self?.updateRingPosition(landmarks: firstHand, worldLandmarks: firstWorld, isLeftHand: isLeftHand)
     }
@@ -775,13 +616,100 @@ struct OneEuroFilter {
   }
 }
 
+private extension UIImage {
+  func withWhiteBackgroundRemoved() -> UIImage {
+    guard let cgImage = self.cgImage else { return self }
+
+    let width = cgImage.width
+    let height = cgImage.height
+    let bytesPerPixel = 4
+    let bytesPerRow = width * bytesPerPixel
+    var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+          )
+    else {
+      return self
+    }
+
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    var minX = width
+    var minY = height
+    var maxX = 0
+    var maxY = 0
+
+    for y in 0..<height {
+      for x in 0..<width {
+        let offset = y * bytesPerRow + x * bytesPerPixel
+        let r = Float(pixels[offset])
+        let g = Float(pixels[offset + 1])
+        let b = Float(pixels[offset + 2])
+        let originalAlpha = Float(pixels[offset + 3])
+
+        let distanceFromWhite = sqrtf(
+          powf(255 - r, 2) + powf(255 - g, 2) + powf(255 - b, 2)
+        )
+        let saturation = max(r, max(g, b)) - min(r, min(g, b))
+
+        var alphaFactor: Float = 1
+        if saturation < 18 {
+          alphaFactor = min(1, max(0, (distanceFromWhite - 10) / 42))
+        } else if saturation < 34 && distanceFromWhite < 38 {
+          alphaFactor = min(1, max(0.25, (distanceFromWhite - 8) / 34))
+        }
+
+        let newAlpha = originalAlpha * alphaFactor
+        pixels[offset] = UInt8(max(0, min(255, r * alphaFactor)))
+        pixels[offset + 1] = UInt8(max(0, min(255, g * alphaFactor)))
+        pixels[offset + 2] = UInt8(max(0, min(255, b * alphaFactor)))
+        pixels[offset + 3] = UInt8(max(0, min(255, newAlpha)))
+
+        if newAlpha > 12 {
+          minX = min(minX, x)
+          minY = min(minY, y)
+          maxX = max(maxX, x)
+          maxY = max(maxY, y)
+        }
+      }
+    }
+
+    guard let processedCG = context.makeImage() else { return self }
+    let cropPadding = 12
+    let cropX = max(0, minX - cropPadding)
+    let cropY = max(0, minY - cropPadding)
+    let cropMaxX = min(width - 1, maxX + cropPadding)
+    let cropMaxY = min(height - 1, maxY + cropPadding)
+    let cropWidth = max(1, cropMaxX - cropX + 1)
+    let cropHeight = max(1, cropMaxY - cropY + 1)
+    let cropRect = CGRect(x: cropX, y: cropY, width: cropWidth, height: cropHeight)
+
+    guard minX <= maxX,
+          minY <= maxY,
+          let croppedCG = processedCG.cropping(to: cropRect)
+    else {
+      return UIImage(cgImage: processedCG, scale: scale, orientation: imageOrientation)
+    }
+
+    return UIImage(cgImage: croppedCG, scale: scale, orientation: imageOrientation)
+  }
+}
+
 // MARK: - Debug Overlay Data & View
 
 struct DebugOverlayData {
   var landmarks: [(x: CGFloat, y: CGFloat)] = []  // normalized 0-1
   var ringNorm: CGPoint = .zero                     // ring position normalized
   var palmCenter: CGPoint = .zero                   // palm center normalized
-  var palmNormal3D: simd_float3 = .zero             // palm normal in SceneKit space
+  var palmNormal3D: simd_float3 = .zero             // dorsal normal in camera-facing space
   var ringQuaternion: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
   var mcpWidth: Float = 0
   var boneMaxWidth: Float = 0
@@ -793,7 +721,7 @@ struct DebugOverlayData {
   var direction3D: simd_float3 = .zero    // finger direction (ring Y axis) — SCREEN based
   var rightVec3D: simd_float3 = .zero     // ring lateral axis (ring X axis)
   var smoothedScale: Float = 0            // smoothed ring scale for ring outline size
-  // Bone 3D data (world landmarks in SceneKit space) for comparison
+  // Bone 3D data (world landmarks in camera-facing space) for comparison
   var boneDir3D: simd_float3 = .zero      // world finger bone direction (13→14)
   var boneDorsalDir3D: simd_float3 = .zero // palmNormal projected ⊥ bone (where dorsal faces on bone)
   var boneAngleScreen: Float = 0          // bone angle on screen (atan2)
@@ -885,7 +813,7 @@ class DebugOverlayView: UIView {
 
     // Finger width perpendicular lines at ring position
     let ringPt = toView(data.ringNorm.x, data.ringNorm.y)
-    let dir2D = data.direction3D  // SceneKit space (Y up)
+    let dir2D = data.direction3D  // view-space direction (Y up)
     let dir2Dlen = CGFloat(sqrtf(dir2D.x * dir2D.x + dir2D.y * dir2D.y))
     if dir2Dlen > 0.01 {
       // Perpendicular to finger direction in screen space
