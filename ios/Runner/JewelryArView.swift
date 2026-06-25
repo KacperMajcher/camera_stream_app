@@ -43,10 +43,11 @@ class JewelryArView: UIView {
 
   private var eventSink: FlutterEventSink?
   private let eventChannel: FlutterEventChannel
+  private let methodChannel: FlutterMethodChannel
 
   // MARK: - Configuration
 
-  private let modelAsset: String
+  private var modelAsset: String
   private var ringSize: Int
 
   // MARK: - One-Euro Filters (adaptive smoothing: smooth when still, responsive when fast)
@@ -72,10 +73,15 @@ class JewelryArView: UIView {
       name: "jewelry_ar_view_events",
       binaryMessenger: messenger
     )
+    methodChannel = FlutterMethodChannel(
+      name: "jewelry_ar_view_methods_\(viewId)",
+      binaryMessenger: messenger
+    )
 
     super.init(frame: frame)
 
     eventChannel.setStreamHandler(self)
+    methodChannel.setMethodCallHandler(handleMethodCall)
     setupCamera()
     setupRingOverlay()
     setupMediaPipe()
@@ -83,6 +89,10 @@ class JewelryArView: UIView {
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) not supported")
+  }
+
+  deinit {
+    methodChannel.setMethodCallHandler(nil)
   }
 
   override func layoutSubviews() {
@@ -168,6 +178,32 @@ class JewelryArView: UIView {
     debugToggleButton.layer.zPosition = 300
     debugToggleButton.addTarget(self, action: #selector(toggleDebug), for: .touchUpInside)
     addSubview(debugToggleButton)
+  }
+
+  private func handleMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "setRingAsset":
+      guard let args = call.arguments as? [String: Any],
+            let asset = args["asset"] as? String
+      else {
+        result(FlutterError(code: "bad_args", message: "Missing ring asset", details: nil))
+        return
+      }
+      setRingAsset(asset)
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func setRingAsset(_ asset: String) {
+    guard asset != modelAsset else { return }
+    modelAsset = asset
+    ringImageView.image = loadRingImage()
+    ringImageView.isHidden = true
+    lastRingCenter = nil
+    lastRingWidth = nil
+    filterScale.reset()
   }
 
   private func loadRingImage() -> UIImage? {

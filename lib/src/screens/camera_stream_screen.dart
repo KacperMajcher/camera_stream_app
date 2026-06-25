@@ -2,17 +2,15 @@ import 'dart:math';
 import 'package:camera_stream_app/src/services/hand_tracking_service.dart';
 import 'package:camera_stream_app/src/widgets/jewelry_ar_view.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-enum RingSize {
-  r1('1', 1),
-  r2('2', 2),
-  r3('3', 3),
-  r4('4', 4),
-  r5('5', 5);
+enum RingOption {
+  classic('Classic', 'assets/ring.avif'),
+  solitaire('Ring 2', 'assets/ring2.avif');
 
-  const RingSize(this.label, this.assetIndex);
+  const RingOption(this.label, this.asset);
   final String label;
-  final int assetIndex;
+  final String asset;
 }
 
 class CameraStreamView extends StatefulWidget {
@@ -25,7 +23,8 @@ class CameraStreamView extends StatefulWidget {
 class _CameraStreamViewState extends State<CameraStreamView> {
   final _handTracking = HandTrackingService();
   HandLandmarks3D? _landmarks;
-  RingSize _selectedSize = RingSize.r3;
+  RingOption _selectedRing = RingOption.classic;
+  MethodChannel? _platformChannel;
   bool _isTrackingStarted = false;
 
   @override
@@ -69,17 +68,23 @@ class _CameraStreamViewState extends State<CameraStreamView> {
           Expanded(
             child: Stack(
               children: [
-                // Native platform view: camera + SceneKit/Filament + MediaPipe
+                // Native platform view: camera + ring overlay + MediaPipe
                 Positioned.fill(
                   child: JewelryArView(
-                    ringSize: _selectedSize.assetIndex,
-                    onPlatformViewCreated: (_) {
-                      if (_isTrackingStarted) return;
-                      _isTrackingStarted = true;
-                      _handTracking.startListening();
-                      _handTracking.landmarksStream.listen((lm) {
-                        if (mounted) setState(() => _landmarks = lm);
-                      });
+                    modelAsset: _selectedRing.asset,
+                    onPlatformViewCreated: (id) {
+                      _platformChannel = MethodChannel(
+                        'jewelry_ar_view_methods_$id',
+                      );
+                      _setNativeRingAsset(_selectedRing.asset);
+
+                      if (!_isTrackingStarted) {
+                        _isTrackingStarted = true;
+                        _handTracking.startListening();
+                        _handTracking.landmarksStream.listen((lm) {
+                          if (mounted) setState(() => _landmarks = lm);
+                        });
+                      }
                     },
                   ),
                 ),
@@ -148,55 +153,86 @@ class _CameraStreamViewState extends State<CameraStreamView> {
               ],
             ),
           ),
-          _SizeSelector(
-            selected: _selectedSize,
-            onChanged: (s) => setState(() => _selectedSize = s),
-          ),
+          _RingAssetSelector(selected: _selectedRing, onChanged: _selectRing),
         ],
       ),
     );
   }
+
+  Future<void> _setNativeRingAsset(String asset) async {
+    try {
+      await _platformChannel?.invokeMethod<void>('setRingAsset', {
+        'asset': asset,
+      });
+    } on PlatformException {
+      // Native view may not be ready yet; the selected asset is also passed
+      // through creationParams when the platform view is created.
+    }
+  }
+
+  void _selectRing(RingOption ring) {
+    setState(() => _selectedRing = ring);
+    _setNativeRingAsset(ring.asset);
+  }
 }
 
-class _SizeSelector extends StatelessWidget {
-  final RingSize selected;
-  final ValueChanged<RingSize> onChanged;
+class _RingAssetSelector extends StatelessWidget {
+  final RingOption selected;
+  final ValueChanged<RingOption> onChanged;
 
-  const _SizeSelector({required this.selected, required this.onChanged});
+  const _RingAssetSelector({required this.selected, required this.onChanged});
 
   @override
   Widget build(BuildContext context) {
     return Container(
       color: Colors.black54,
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: RingSize.values.map((size) {
-          final isSelected = size == selected;
-          return GestureDetector(
-            onTap: () => onChanged(size),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-              decoration: BoxDecoration(
-                color: isSelected ? Colors.amber : Colors.transparent,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: isSelected ? Colors.amber : Colors.white54,
-                  width: 1.5,
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: RingOption.values.map((ring) {
+            final isSelected = ring == selected;
+            return GestureDetector(
+              onTap: () => onChanged(ring),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                width: 88,
+                height: 64,
+                margin: const EdgeInsets.symmetric(horizontal: 8),
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: isSelected
+                      ? Colors.amber.withAlpha(36)
+                      : Colors.white.withAlpha(12),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: isSelected ? Colors.amber : Colors.white54,
+                    width: isSelected ? 2 : 1,
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: Image.asset(ring.asset, fit: BoxFit.contain),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      ring.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: isSelected ? Colors.amber : Colors.white,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              child: Text(
-                size.label,
-                style: TextStyle(
-                  color: isSelected ? Colors.black : Colors.white,
-                  fontWeight: FontWeight.w600,
-                  fontSize: 14,
-                ),
-              ),
-            ),
-          );
-        }).toList(),
+            );
+          }).toList(),
+        ),
       ),
     );
   }

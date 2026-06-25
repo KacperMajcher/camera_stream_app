@@ -22,6 +22,7 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.platform.PlatformView
 import java.io.File
 import java.io.FileOutputStream
@@ -33,17 +34,18 @@ class JewelryArPlatformView(
     context: Context,
     viewId: Int,
     messenger: BinaryMessenger,
-    args: Map<String, Any>,
+    args: Map<String, Any?>,
 ) : PlatformView, DefaultLifecycleObserver {
 
     private val rootView = FrameLayout(context)
     private val previewView = PreviewView(context)
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val eventChannel = EventChannel(messenger, "jewelry_ar_view_events")
+    private val methodChannel = MethodChannel(messenger, "jewelry_ar_view_methods_$viewId")
     private var eventSink: EventChannel.EventSink? = null
 
     private var handLandmarker: HandLandmarker? = null
-    private val modelAsset = (args["modelAsset"] as? String) ?: "assets/ring.glb"
+    private var modelAsset = (args["modelAsset"] as? String) ?: "assets/ring.avif"
 
     init {
         previewView.layoutParams =
@@ -64,6 +66,15 @@ class JewelryArPlatformView(
                 }
             },
         )
+        methodChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setRingAsset" -> {
+                    modelAsset = call.argument<String>("asset") ?: modelAsset
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         initMediaPipe(context)
         startCamera(context)
@@ -75,6 +86,7 @@ class JewelryArPlatformView(
         handLandmarker?.close()
         cameraExecutor.shutdown()
         eventChannel.setStreamHandler(null)
+        methodChannel.setMethodCallHandler(null)
     }
 
     @SuppressLint("UnsafeOptInUsageError")
@@ -188,4 +200,3 @@ class JewelryArPlatformView(
         private const val TAG = "JewelryArPlatformView"
     }
 }
-
